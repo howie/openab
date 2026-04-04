@@ -254,13 +254,13 @@ The Docker image bundles both `agent-broker` and `kiro-cli` in a single containe
 Use one of these prompts with any coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) on the host that has `helm` and `kubectl` access to your cluster:
 
 **Kiro CLI (default):**
-> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, authenticate kiro-cli inside the pod using `kiro-cli login --use-device-flow`, then restart the deployment.
+> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
 
 **Codex:**
-> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=codex`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, authenticate codex inside the pod using `codex login --device-auth`, then restart the deployment.
+> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=codex`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
 
 **Claude Code:**
-> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=claude`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, authenticate claude inside the pod using `claude setup-token`, set the token with `--set env.CLAUDE_CODE_OAUTH_TOKEN=<token>`, then restart the deployment.
+> Install agent-broker on my local k8s cluster using the Helm chart from https://thepagent.github.io/agent-broker with `--set agent.preset=claude`. My Discord bot token is in the environment variable DISCORD_BOT_TOKEN and my channel ID is <REPLACE_WITH_YOUR_CHANNEL_ID>. After install, follow the NOTES output to authenticate, then restart the deployment.
 
 ### Build & Push
 
