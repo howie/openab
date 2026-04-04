@@ -3,6 +3,16 @@ entries:
   agent-broker:
   - apiVersion: v2
     appVersion: 7a6fe69
+    created: "2026-04-04T12:52:47.787284265Z"
+    description: Discord ↔ ACP coding CLI bridge (Kiro CLI, Claude Code, Codex, Gemini)
+    digest: 1dc70356c4570975e64bbfa4f1df2baa3b2d7d2762d539b575e23ec54a7c70c9
+    name: agent-broker
+    type: application
+    urls:
+    - https://github.com/thepagent/agent-broker/releases/download/agent-broker-0.2.0/agent-broker-0.2.0.tgz
+    version: 0.2.0
+  - apiVersion: v2
+    appVersion: 7a6fe69
     created: "2026-04-04T12:20:51.705030556Z"
     description: Discord ↔ ACP coding CLI bridge (Kiro CLI, Claude Code, Codex, Gemini)
     digest: 4f6983d94b255e4924e80086f550aaf248920296b5a4b181c49e4d7a629de0b1
@@ -121,4 +131,4 @@ entries:
     urls:
     - https://github.com/thepagent/agent-broker/releases/download/agent-broker-0.1.1/agent-broker-0.1.1.tgz
     version: 0.1.1
-generated: "2026-04-04T12:20:51.705099555Z"
+generated: "2026-04-04T12:52:47.787380545Z"
