@@ -73,6 +73,9 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Prepend Discord user identity so the downstream CLI can identify who sent the message
+        let prompt = format!("[discord_user:{} @{}] {}", msg.author.id, msg.author.name, prompt);
+
         tracing::debug!(prompt = %prompt, in_thread, "processing");
 
         let thread_id = if in_thread {
