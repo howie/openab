@@ -13,9 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # Pre-install codex-acp and codex CLI globally
 RUN npm install -g @zed-industries/codex-acp@0.9.5 @openai/codex --retry 3
 
-RUN mkdir -p /home/agent && chown node:node /home/agent
-ENV HOME=/home/agent
-WORKDIR /home/agent
+ENV HOME=/home/node
+WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/agent-broker /usr/local/bin/agent-broker
 

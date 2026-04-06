@@ -18,7 +18,7 @@ data:
     [agent]
     command = "{{ include "agent-broker.agent.command" . | trim }}"
     args = {{ include "agent-broker.agent.args" . | trim }}
-    working_dir = "{{ .Values.agent.workingDir }}"
+    working_dir = "{{ include "agent-broker.agent.home" . | trim }}"
     {{- if .Values.agent.env }}
     env = { {{ range $k, $v := .Values.agent.env }}{{ $k }} = "{{ $v }}", {{ end }} }
     {{- end }}

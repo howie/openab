@@ -13,9 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # Install claude-agent-acp adapter and Claude Code CLI
 RUN npm install -g @agentclientprotocol/claude-agent-acp@0.25.0 @anthropic-ai/claude-code --retry 3
 
-RUN mkdir -p /home/agent && chown node:node /home/agent
-ENV HOME=/home/agent
-WORKDIR /home/agent
+ENV HOME=/home/node
+WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/agent-broker /usr/local/bin/agent-broker
 

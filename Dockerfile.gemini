@@ -13,9 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # Install Gemini CLI (native ACP support via --acp)
 RUN npm install -g @google/gemini-cli --retry 3
 
-RUN mkdir -p /home/agent && chown node:node /home/agent
-ENV HOME=/home/agent
-WORKDIR /home/agent
+ENV HOME=/home/node
+WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/agent-broker /usr/local/bin/agent-broker
 

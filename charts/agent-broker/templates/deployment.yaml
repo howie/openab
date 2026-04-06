@@ -39,7 +39,7 @@ spec:
                   name: {{ include "agent-broker.fullname" . }}
                   key: discord-bot-token
             - name: HOME
-              value: /home/agent
+              value: {{ include "agent-broker.agent.home" . | trim }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -58,11 +58,11 @@ spec:
               readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: data
-              mountPath: /home/agent
+              mountPath: {{ include "agent-broker.agent.home" . | trim }}
             {{- end }}
             {{- if .Values.agentsMd }}
             - name: config
-              mountPath: /home/agent/AGENTS.md
+              mountPath: {{ include "agent-broker.agent.home" . | trim }}/AGENTS.md
               subPath: AGENTS.md
             {{- end }}
       {{- with .Values.nodeSelector }}
