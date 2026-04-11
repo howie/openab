@@ -39,41 +39,47 @@ impl EventHandler for Handler {
             || msg.content.contains(&format!("<@{}>", bot_id))
             || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
 
-        let in_thread = if !in_allowed_channel {
+        // Check if message is in a thread whose parent is an allowed channel.
+        // Track parent_id so per-channel config resolves against the parent channel.
+        let (in_thread, parent_channel_id) = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
                 Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let result = gc
-                        .parent_id
-                        .map_or(false, |pid| self.allowed_channels.contains(&pid.get()));
+                    let parent = gc.parent_id.map(|pid| pid.get());
+                    let result = parent.map_or(false, |pid| self.allowed_channels.contains(&pid));
                     tracing::debug!(channel_id = %msg.channel_id, parent_id = ?gc.parent_id, result, "thread check");
-                    result
+                    (result, parent)
                 }
                 Ok(other) => {
                     tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                    false
+                    (false, None)
                 }
                 Err(e) => {
                     tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                    false
+                    (false, None)
                 }
             }
         } else {
-            false
+            (false, None)
         };
 
         if !in_allowed_channel && !in_thread {
             return;
         }
 
-        // Resolve per-channel settings (use parent channel for threads)
-        let effective_channel_id = channel_id.to_string();
-        let require_mention = self.channels.get(&effective_channel_id)
+        // Resolve per-channel settings using the parent channel for threads
+        let config_channel_id = if in_thread {
+            parent_channel_id.unwrap_or(channel_id).to_string()
+        } else {
+            channel_id.to_string()
+        };
+        let channel_override = self.channels.get(&config_channel_id);
+        let require_mention = channel_override
             .and_then(|c| c.require_mention)
             .unwrap_or(self.require_mention);
-        let ignore_other_mentions = self.channels.get(&effective_channel_id)
+        let ignore_other_mentions = channel_override
             .and_then(|c| c.ignore_other_mentions)
             .unwrap_or(self.ignore_other_mentions);
-        let effective_archive_duration = self.channels.get(&effective_channel_id)
+        let effective_archive_duration = channel_override
             .and_then(|c| c.auto_archive_duration)
             .unwrap_or(self.auto_archive_duration);
 

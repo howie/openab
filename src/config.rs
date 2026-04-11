@@ -38,31 +38,6 @@ pub struct ChannelConfig {
     pub thread_name_mode: Option<String>,
 }
 
-impl DiscordConfig {
-    pub fn effective_archive_duration(&self, channel_id: &str) -> u32 {
-        self.channels.get(channel_id)
-            .and_then(|c| c.auto_archive_duration)
-            .unwrap_or(self.auto_archive_duration)
-    }
-
-    pub fn effective_require_mention(&self, channel_id: &str) -> bool {
-        self.channels.get(channel_id)
-            .and_then(|c| c.require_mention)
-            .unwrap_or(self.require_mention)
-    }
-
-    pub fn effective_ignore_other_mentions(&self, channel_id: &str) -> bool {
-        self.channels.get(channel_id)
-            .and_then(|c| c.ignore_other_mentions)
-            .unwrap_or(self.ignore_other_mentions)
-    }
-
-    pub fn effective_thread_name_mode(&self, channel_id: &str) -> &str {
-        self.channels.get(channel_id)
-            .and_then(|c| c.thread_name_mode.as_deref())
-            .unwrap_or(&self.thread_name_mode)
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
