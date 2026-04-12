@@ -1,12 +1,14 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::config::SttConfig;
+use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const SLACK_API: &str = "https://slack.com/api";
 
@@ -125,7 +127,6 @@ impl ChatAdapter for SlackAdapter {
         _title: &str,
     ) -> Result<ChannelRef> {
         // Slack threads are implicit — posting with thread_ts creates/continues a thread.
-        // The "thread" is the channel + the trigger message's ts as thread_ts.
         Ok(ChannelRef {
             platform: "slack".into(),
             channel_id: channel.channel_id.clone(),
@@ -172,9 +173,10 @@ pub async fn run_slack_adapter(
     app_token: String,
     allowed_channels: HashSet<String>,
     allowed_users: HashSet<String>,
+    stt_config: SttConfig,
     router: Arc<AdapterRouter>,
 ) -> Result<()> {
-    let adapter = Arc::new(SlackAdapter::new(bot_token));
+    let adapter = Arc::new(SlackAdapter::new(bot_token.clone()));
 
     loop {
         let ws_url = match get_socket_mode_url(&app_token).await {
@@ -216,8 +218,10 @@ pub async fn run_slack_adapter(
                                     handle_app_mention(
                                         event,
                                         &adapter,
+                                        &bot_token,
                                         &allowed_channels,
                                         &allowed_users,
+                                        &stt_config,
                                         &router,
                                     )
                                     .await;
@@ -272,8 +276,10 @@ async fn get_socket_mode_url(app_token: &str) -> Result<String> {
 async fn handle_app_mention(
     event: &serde_json::Value,
     adapter: &Arc<SlackAdapter>,
+    bot_token: &str,
     allowed_channels: &HashSet<String>,
     allowed_users: &HashSet<String>,
+    stt_config: &SttConfig,
     router: &Arc<AdapterRouter>,
 ) {
     let channel_id = match event["channel"].as_str() {
@@ -317,29 +323,71 @@ async fn handle_app_mention(
 
     // Strip bot mention (<@UBOTID>) from text
     let prompt = strip_slack_mention(&text);
-    if prompt.is_empty() {
+
+    // Process file attachments (images, audio)
+    let files = event["files"].as_array();
+    let has_files = files.map_or(false, |f| !f.is_empty());
+
+    if prompt.is_empty() && !has_files {
         return;
+    }
+
+    let mut extra_blocks = Vec::new();
+    if let Some(files) = files {
+        for file in files {
+            let mimetype = file["mimetype"].as_str().unwrap_or("");
+            let filename = file["name"].as_str().unwrap_or("file");
+            let size = file["size"].as_u64().unwrap_or(0);
+            // Slack private files require Bearer token to download
+            let url = file["url_private_download"]
+                .as_str()
+                .or_else(|| file["url_private"].as_str())
+                .unwrap_or("");
+
+            if url.is_empty() {
+                continue;
+            }
+
+            if media::is_audio_mime(mimetype) {
+                if stt_config.enabled {
+                    if let Some(transcript) = media::download_and_transcribe(
+                        url,
+                        filename,
+                        mimetype,
+                        size,
+                        stt_config,
+                        Some(bot_token),
+                    ).await {
+                        debug!(filename, chars = transcript.len(), "voice transcript injected");
+                        extra_blocks.insert(0, ContentBlock::Text {
+                            text: format!("[Voice message transcript]: {transcript}"),
+                        });
+                    }
+                } else {
+                    debug!(filename, "skipping audio attachment (STT disabled)");
+                }
+            } else if let Some(block) = media::download_and_encode_image(
+                url,
+                Some(mimetype),
+                filename,
+                size,
+                Some(bot_token),
+            ).await {
+                debug!(filename, "adding image attachment");
+                extra_blocks.push(block);
+            }
+        }
     }
 
     let sender = SenderContext {
         schema: "openab.sender.v1".into(),
         sender_id: user_id.clone(),
-        sender_name: user_id.clone(), // app_mention events don't include display name
+        sender_name: user_id.clone(),
         display_name: user_id.clone(),
         channel: "slack".into(),
         channel_id: channel_id.clone(),
         is_bot: false,
     };
-
-    let sender_json = serde_json::to_string(&sender).unwrap();
-    let prompt_with_sender = format!(
-        "<sender_context>\n{}\n</sender_context>\n\n{}",
-        sender_json, prompt
-    );
-
-    let content_blocks = vec![ContentBlock::Text {
-        text: prompt_with_sender,
-    }];
 
     let trigger_msg = MessageRef {
         channel: ChannelRef {
@@ -361,7 +409,7 @@ async fn handle_app_mention(
 
     let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
     if let Err(e) = router
-        .handle_message(&adapter_dyn, &thread_channel, &sender, content_blocks, &trigger_msg)
+        .handle_message(&adapter_dyn, &thread_channel, &sender, &prompt, extra_blocks, &trigger_msg)
         .await
     {
         error!("Slack handle_message error: {e}");

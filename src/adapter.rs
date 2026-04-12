@@ -104,16 +104,41 @@ impl AdapterRouter {
 
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
-    /// This method handles session management and streaming.
+    /// This method handles sender context injection, session management, and streaming.
     pub async fn handle_message(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
         thread_channel: &ChannelRef,
-        _sender: &SenderContext,
-        content_blocks: Vec<ContentBlock>,
+        sender: &SenderContext,
+        prompt: &str,
+        extra_blocks: Vec<ContentBlock>,
         trigger_msg: &MessageRef,
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
+
+        // Build content blocks: sender context + prompt text, then extra (images, transcripts)
+        let sender_json = serde_json::to_string(sender).unwrap();
+        let prompt_with_sender = format!(
+            "<sender_context>\n{}\n</sender_context>\n\n{}",
+            sender_json, prompt
+        );
+
+        let mut content_blocks = Vec::with_capacity(1 + extra_blocks.len());
+        // Prepend any transcript blocks (they go before the text block)
+        for block in &extra_blocks {
+            if matches!(block, ContentBlock::Text { .. }) {
+                content_blocks.push(block.clone());
+            }
+        }
+        content_blocks.push(ContentBlock::Text {
+            text: prompt_with_sender,
+        });
+        // Append non-text blocks (images)
+        for block in extra_blocks {
+            if !matches!(block, ContentBlock::Text { .. }) {
+                content_blocks.push(block);
+            }
+        }
 
         let thinking_msg = adapter.send_message(thread_channel, "...").await?;
 

@@ -4,6 +4,7 @@ mod config;
 mod discord;
 mod error_display;
 mod format;
+mod media;
 mod reactions;
 mod slack;
 mod stt;
@@ -81,12 +82,14 @@ async fn main() -> anyhow::Result<()> {
             "starting slack adapter"
         );
         let router = router.clone();
+        let stt = cfg.stt.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = slack::run_slack_adapter(
                 slack_cfg.bot_token,
                 slack_cfg.app_token,
                 slack_cfg.allowed_channels.into_iter().collect(),
                 slack_cfg.allowed_users.into_iter().collect(),
+                stt,
                 router,
             )
             .await
