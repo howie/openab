@@ -16,7 +16,7 @@ use serenity::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages (from any other bot) in a
 /// channel or thread. When this many recent messages are all from
@@ -205,6 +205,7 @@ impl EventHandler for Handler {
         });
 
         // Process attachments: route by content type (audio → STT, image → encode)
+        let mut audio_skipped = false;
         if !msg.attachments.is_empty() {
             for attachment in &msg.attachments {
                 if is_audio_attachment(attachment) {
@@ -216,12 +217,22 @@ impl EventHandler for Handler {
                             });
                         }
                     } else {
-                        debug!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        audio_skipped = true;
                     }
                 } else if let Some(content_block) = download_and_encode_image(attachment).await {
                     debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                     content_blocks.push(content_block);
                 }
+            }
+        }
+
+        // If audio was skipped, react with 🎤 so the user knows their voice message was noticed
+        if audio_skipped {
+            let _ = msg.react(&ctx.http, ReactionType::Unicode("🎤".into())).await;
+            // Voice-only message: no text and only the sender_context block → early return
+            if prompt.is_empty() && content_blocks.len() == 1 {
+                return;
             }
         }
 
