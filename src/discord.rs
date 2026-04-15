@@ -791,8 +791,11 @@ fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> Str
     out
 }
 
-static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
+static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@&\d+>").unwrap()
+});
+static USER_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<@!?\d+>").unwrap()
 });
 
 fn resolve_mentions(content: &str, bot_id: UserId, mentions: &[User]) -> String {
@@ -811,8 +814,9 @@ fn resolve_mentions(content: &str, bot_id: UserId, mentions: &[User]) -> String 
             .replace(&format!("<@{}>", user.id), &display)
             .replace(&format!("<@!{}>", user.id), &display);
     }
-    // 3. Fallback: replace any remaining unresolved mentions (including role mentions)
-    let out = MENTION_RE.replace_all(&out, "@unknown").to_string();
+    // 3. Fallback: replace any remaining unresolved mentions
+    let out = ROLE_MENTION_RE.replace_all(&out, "@(role)");
+    let out = USER_MENTION_RE.replace_all(&out, "@(user)").to_string();
     out.trim().to_string()
 }
 
