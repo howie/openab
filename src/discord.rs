@@ -193,8 +193,6 @@ impl EventHandler for Handler {
             "channel": "discord",
             "channel_id": msg.channel_id.to_string(),
             "is_bot": msg.author.bot,
-            "self_id": bot_id.to_string(),
-            "mentioned_user_ids": msg.mentions.iter().map(|u| u.id.to_string()).collect::<Vec<_>>(),
         });
         let prompt_with_sender = format!(
             "<sender_context>\n{}\n</sender_context>\n\n{}",
