@@ -2,6 +2,9 @@
 bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["1234567890"]
 # allowed_users = ["<YOUR_DISCORD_USER_ID>"]  # empty or omitted = allow all users
+# allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
+                               # "mentions" is recommended for multi-agent collaboration
+# trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
 
 [agent]
 command = "kiro-cli"
@@ -31,6 +34,15 @@ working_dir = "/home/agent"
 # args = ["--acp", "--stdio"]
 # working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
+
+# [agent]
+# command = "opencode"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # Note: opencode handles tool authorization internally and never emits
+# # session/request_permission — all tools run without user confirmation,
+# # equivalent to --trust-all-tools on other backends.
+# # Run `opencode auth login` once before starting openab.
 
 [pool]
 max_sessions = 10

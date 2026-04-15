@@ -42,12 +42,3 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
     }
     chunks
 }
-
-/// Truncate a string to at most `limit` Unicode characters.
-/// Discord's message limit counts Unicode characters, not bytes.
-pub fn truncate_chars(s: &str, limit: usize) -> &str {
-    match s.char_indices().nth(limit) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}

@@ -24,6 +24,23 @@ data:
     {{- end }}
     {{- end }}
     allowed_users = {{ $cfg.discord.allowedUsers | default list | toJson }}
+    {{- if $cfg.discord.allowBotMessages }}
+    {{- if not (has $cfg.discord.allowBotMessages (list "off" "mentions" "all")) }}
+    {{- fail (printf "agents.%s.discord.allowBotMessages must be one of: off, mentions, all — got: %s" $name $cfg.discord.allowBotMessages) }}
+    {{- end }}
+    allow_bot_messages = "{{ $cfg.discord.allowBotMessages }}"
+    {{- end }}
+    {{- range $cfg.discord.trustedBotIds }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "discord.trustedBotIds contains a mangled ID: %s — use --set-string instead of --set for bot IDs" (toString .)) }}
+    {{- end }}
+    {{- if not (regexMatch "^[0-9]{17,20}$" (toString .)) }}
+    {{- fail (printf "discord.trustedBotIds contains an invalid bot ID: %s — must be a 17-20 digit snowflake ID" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    {{- if $cfg.discord.trustedBotIds }}
+    trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
+    {{- end }}
 
     [agent]
     command = "{{ $cfg.command }}"

@@ -1,5 +1,5 @@
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, SttConfig};
+use crate::config::{AllowBots, ReactionsConfig, SttConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::reactions::StatusReactionController;
@@ -18,6 +18,15 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
+/// Hard cap on consecutive bot messages (from any other bot) in a
+/// channel or thread. When this many recent messages are all from
+/// bots other than ourselves, we stop responding to prevent runaway
+/// loops between multiple bots in "all" mode.
+///
+/// Note: must be ≤ 255 because Serenity's `GetMessages::limit()` takes `u8`.
+/// Inspired by OpenClaw's `session.agentToAgent.maxPingPongTurns`.
+const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
+
 /// Reusable HTTP client for downloading Discord attachments.
 /// Built once with a 30s timeout and rustls TLS (no native-tls deps).
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -33,16 +42,19 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
+    pub allow_bot_messages: AllowBots,
+    pub trusted_bot_ids: HashSet<u64>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
+        let bot_id = ctx.cache.current_user().id;
+
+        // Always ignore own messages
+        if msg.author.id == bot_id {
             return;
         }
-
-        let bot_id = ctx.cache.current_user().id;
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
@@ -51,6 +63,71 @@ impl EventHandler for Handler {
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id))
             || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+
+        // Bot message gating — runs after self-ignore but before channel/user
+        // allowlist checks. This ordering is intentional: channel checks below
+        // apply uniformly to both human and bot messages, so a bot mention in
+        // a non-allowed channel is still rejected by the channel check.
+        if msg.author.bot {
+            match self.allow_bot_messages {
+                AllowBots::Off => return,
+                AllowBots::Mentions => if !is_mentioned { return; },
+                AllowBots::All => {
+                    // Safety net: count consecutive messages from any bot
+                    // (excluding ourselves) in recent history. If all recent
+                    // messages are from other bots, we've likely entered a
+                    // loop. This counts *all* other-bot messages, not just
+                    // one specific bot — so 3 bots taking turns still hits
+                    // the cap (which is intentionally conservative).
+                    //
+                    // Try cache first to avoid an API call on every bot
+                    // message. Fall back to API on cache miss. If both fail,
+                    // reject the message (fail-closed) to avoid unbounded
+                    // loops during Discord API outages.
+                    let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
+                    let history = ctx.cache.channel_messages(msg.channel_id)
+                        .map(|msgs| {
+                            let mut recent: Vec<_> = msgs.iter()
+                                .filter(|(mid, _)| **mid < msg.id)
+                                .map(|(_, m)| m.clone())
+                                .collect();
+                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id)); // newest first
+                            recent.truncate(cap);
+                            recent
+                        })
+                        .filter(|msgs| !msgs.is_empty());
+
+                    let recent = if let Some(cached) = history {
+                        cached
+                    } else {
+                        match msg.channel_id
+                            .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(MAX_CONSECUTIVE_BOT_TURNS))
+                            .await
+                        {
+                            Ok(msgs) => msgs,
+                            Err(e) => {
+                                tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                return;
+                            }
+                        }
+                    };
+
+                    let consecutive_bot = recent.iter()
+                        .take_while(|m| m.author.bot && m.author.id != bot_id)
+                        .count();
+                    if consecutive_bot >= cap {
+                        tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                        return;
+                    }
+                },
+            }
+
+            // If trusted_bot_ids is set, only allow bots on the list
+            if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
+                tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                return;
+            }
+        }
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
@@ -128,6 +205,7 @@ impl EventHandler for Handler {
         });
 
         // Process attachments: route by content type (audio → STT, text file → inline, image → encode)
+        let mut audio_skipped = false;
         if !msg.attachments.is_empty() {
             let mut text_file_bytes: u64 = 0;
             let mut text_file_count: u32 = 0;
@@ -144,7 +222,8 @@ impl EventHandler for Handler {
                             });
                         }
                     } else {
-                        debug!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                        audio_skipped = true;
                     }
                 } else if is_text_attachment(attachment) {
                     if text_file_count >= TEXT_FILE_COUNT_CAP {
@@ -167,6 +246,15 @@ impl EventHandler for Handler {
                     debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                     content_blocks.push(content_block);
                 }
+            }
+        }
+
+        // If audio was skipped, react with 🎤 so the user knows their voice message was noticed
+        if audio_skipped {
+            let _ = msg.react(&ctx.http, ReactionType::Unicode("🎤".into())).await;
+            // Voice-only message: no text and only the sender_context block → early return
+            if prompt.is_empty() && content_blocks.len() == 1 {
+                return;
             }
         }
 
@@ -578,8 +666,13 @@ async fn stream_prompt(
                             let content = buf_rx.borrow_and_update().clone();
                             if content != last_content {
                                 let display = if content.chars().count() > 1900 {
-                                    let truncated = format::truncate_chars(&content, 1900);
-                                    format!("{truncated}…")
+                                    // Tail-priority: keep the last 1900 chars so the
+                                    // user always sees the most recent agent output
+                                    // (e.g. a confirmation prompt) instead of old tool lines.
+                                    let total = content.chars().count();
+                                    let skip = total - 1900;
+                                    let truncated: String = content.chars().skip(skip).collect();
+                                    format!("…(truncated)\n{truncated}")
                                 } else {
                                     content.clone()
                                 };
@@ -614,7 +707,7 @@ async fn stream_prompt(
                                 // Reaction: back to thinking after tools
                             }
                             text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         AcpEvent::Thinking => {
                             reactions.set_thinking().await;
@@ -639,7 +732,7 @@ async fn stream_prompt(
                                     state: ToolState::Running,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         AcpEvent::ToolDone { id, title, status } => {
                             reactions.set_thinking().await;
@@ -667,7 +760,7 @@ async fn stream_prompt(
                                     state: new_state,
                                 });
                             }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
                         }
                         _ => {}
                     }
@@ -679,7 +772,7 @@ async fn stream_prompt(
             let _ = edit_handle.await;
 
             // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
+            let final_content = compose_display(&tool_lines, &text_buf, false);
             // If ACP returned both an error and partial text, show both.
             // This can happen when the agent started producing content before hitting an error
             // (e.g. context length limit, rate limit mid-stream). Showing both gives users
@@ -747,14 +840,58 @@ impl ToolEntry {
     }
 }
 
-fn compose_display(tool_lines: &[ToolEntry], text: &str) -> String {
+/// Maximum number of finished (or running) tool entries to show individually
+/// during streaming before collapsing into a summary line.
+///
+/// A typical tool line is 40–80 chars (icon + backtick title + suffix).
+/// At 3 lines ≈ 120–240 chars, consuming 6–13 % of the 1900-char Discord
+/// streaming budget, leaving 1660+ chars for agent text.  Beyond 3, tool
+/// titles tend to grow (full shell commands, URLs) so budget consumption
+/// rises non-linearly.  3 is also the practical "glanceable" limit.
+const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+
+fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> String {
     let mut out = String::new();
     if !tool_lines.is_empty() {
-        for entry in tool_lines {
-            out.push_str(&entry.render());
-            out.push('\n');
+        if streaming {
+            let done = tool_lines.iter().filter(|e| e.state == ToolState::Completed).count();
+            let failed = tool_lines.iter().filter(|e| e.state == ToolState::Failed).count();
+            let running: Vec<_> = tool_lines.iter().filter(|e| e.state == ToolState::Running).collect();
+            let finished = done + failed;
+
+            if finished <= TOOL_COLLAPSE_THRESHOLD {
+                for entry in tool_lines.iter().filter(|e| e.state != ToolState::Running) {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            } else {
+                let mut parts = Vec::new();
+                if done > 0 { parts.push(format!("✅ {done}")); }
+                if failed > 0 { parts.push(format!("❌ {failed}")); }
+                out.push_str(&format!("{} tool(s) completed\n", parts.join(" · ")));
+            }
+
+            if running.len() <= TOOL_COLLAPSE_THRESHOLD {
+                for entry in &running {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            } else {
+                // Parallel running tools exceed threshold — show last N + summary
+                let hidden = running.len() - TOOL_COLLAPSE_THRESHOLD;
+                out.push_str(&format!("🔧 {hidden} more running\n"));
+                for entry in running.iter().skip(hidden) {
+                    out.push_str(&entry.render());
+                    out.push('\n');
+                }
+            }
+        } else {
+            for entry in tool_lines {
+                out.push_str(&entry.render());
+                out.push('\n');
+            }
         }
-        out.push('\n');
+        if !out.is_empty() { out.push('\n'); }
     }
     out.push_str(text.trim_end());
     out
@@ -885,5 +1022,105 @@ mod tests {
     fn invalid_data_returns_error() {
         let garbage = vec![0x00, 0x01, 0x02, 0x03];
         assert!(resize_and_compress(&garbage).is_err());
+    }
+
+    // --- compose_display tests ---
+
+    fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
+        ToolEntry { id: id.to_string(), title: title.to_string(), state }
+    }
+
+    #[test]
+    fn compose_display_at_threshold_shows_individual_lines() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "hello", true);
+        assert!(out.contains("✅ `cmd-a`"), "should show individual tool");
+        assert!(out.contains("✅ `cmd-b`"), "should show individual tool");
+        assert!(out.contains("✅ `cmd-c`"), "should show individual tool");
+        assert!(!out.contains("tool(s) completed"), "should not collapse at threshold");
+    }
+
+    #[test]
+    fn compose_display_above_threshold_collapses() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+            tool("4", "cmd-d", ToolState::Completed),
+        ];
+        let out = compose_display(&tools, "hello", true);
+        assert!(out.contains("✅ 4 tool(s) completed"), "should collapse above threshold");
+        assert!(!out.contains("`cmd-a`"), "individual tools should be hidden");
+    }
+
+    #[test]
+    fn compose_display_mixed_completed_and_failed() {
+        let tools = vec![
+            tool("1", "ok-1", ToolState::Completed),
+            tool("2", "ok-2", ToolState::Completed),
+            tool("3", "ok-3", ToolState::Completed),
+            tool("4", "fail-1", ToolState::Failed),
+            tool("5", "fail-2", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "", true);
+        assert!(out.contains("✅ 3 · ❌ 2 tool(s) completed"));
+    }
+
+    #[test]
+    fn compose_display_running_shown_alongside_collapsed() {
+        let tools = vec![
+            tool("1", "done-1", ToolState::Completed),
+            tool("2", "done-2", ToolState::Completed),
+            tool("3", "done-3", ToolState::Completed),
+            tool("4", "done-4", ToolState::Completed),
+            tool("5", "active", ToolState::Running),
+        ];
+        let out = compose_display(&tools, "text", true);
+        assert!(out.contains("✅ 4 tool(s) completed"));
+        assert!(out.contains("🔧 `active`..."));
+        assert!(out.contains("text"));
+    }
+
+    #[test]
+    fn compose_display_parallel_running_guard() {
+        let tools: Vec<_> = (0..5)
+            .map(|i| tool(&i.to_string(), &format!("run-{i}"), ToolState::Running))
+            .collect();
+        let out = compose_display(&tools, "", true);
+        assert!(out.contains("🔧 2 more running"), "should collapse excess running tools");
+        assert!(out.contains("🔧 `run-3`..."), "should show recent running");
+        assert!(out.contains("🔧 `run-4`..."), "should show recent running");
+    }
+
+    #[test]
+    fn compose_display_non_streaming_shows_all() {
+        let tools = vec![
+            tool("1", "cmd-a", ToolState::Completed),
+            tool("2", "cmd-b", ToolState::Completed),
+            tool("3", "cmd-c", ToolState::Completed),
+            tool("4", "cmd-d", ToolState::Completed),
+            tool("5", "cmd-e", ToolState::Failed),
+        ];
+        let out = compose_display(&tools, "final", false);
+        assert!(out.contains("✅ `cmd-a`"));
+        assert!(out.contains("✅ `cmd-d`"));
+        assert!(out.contains("❌ `cmd-e`"));
+        assert!(out.contains("final"));
+        assert!(!out.contains("tool(s) completed"), "non-streaming should not collapse");
+    }
+
+    #[test]
+    fn tail_truncation_preserves_multibyte_chars() {
+        let content = "你好世界🌍abcdefghij";
+        let limit = 10;
+        let total = content.chars().count();
+        let skip = total.saturating_sub(limit);
+        let truncated: String = content.chars().skip(skip).collect();
+        assert_eq!(truncated.chars().count(), limit);
+        assert!(truncated.ends_with("abcdefghij"));
     }
 }

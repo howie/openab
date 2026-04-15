@@ -1,6 +1,6 @@
 [package]
 name = "openab"
-version = "0.7.2"
+version = "0.7.5"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +15,10 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"] }
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json", "blocking"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+unicode-width = "0.2"
+libc = "0.2"

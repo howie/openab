@@ -1,7 +1,7 @@
 image:
   repository: ghcr.io/openabdev/openab
   # tag defaults to .Chart.AppVersion
-  tag: "920ae7e"
+  tag: ""
   pullPolicy: IfNotPresent
 
 podSecurityContext:
@@ -29,6 +29,11 @@ agents:
     #     allowedChannels:
     #       - "YOUR_CHANNEL_ID"
     #     allowedUsers: []
+    #     # allowBotMessages: "off" (default) | "mentions" | "all"
+    #     # recommended for multi-agent collaboration
+    #     allowBotMessages: "off"
+    #     # trustedBotIds: []  # empty = any bot (mode permitting)
+    #     trustedBotIds: []
     #   workingDir: /home/agent
     #   env: {}
     #   envFrom: []
@@ -48,6 +53,33 @@ agents:
     #   tolerations: []
     #   affinity: {}
     #   image: "ghcr.io/openabdev/openab-claude:latest"
+    # opencode:
+    #   command: opencode
+    #   args:
+    #     - acp
+    #   discord:
+    #     botToken: ""
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   agentsMd: ""
+    #   resources: {}
+    #   image: "ghcr.io/openabdev/openab-opencode:latest"
     image: ""
     command: kiro-cli
     args:
@@ -60,6 +92,11 @@ agents:
         - "YOUR_CHANNEL_ID"
       # ⚠️ Use --set-string for user IDs to avoid float64 precision loss
       allowedUsers: []  # empty = allow all users (default)
+      # allowBotMessages: "off" (default) | "mentions" | "all"
+      # recommended for multi-agent collaboration
+      allowBotMessages: "off"
+      # trustedBotIds: []  # empty = any bot (mode permitting); set to restrict
+      trustedBotIds: []
     workingDir: /home/agent
     env: {}
     envFrom: []
