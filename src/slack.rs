@@ -522,28 +522,35 @@ pub async fn run_slack_adapter(
                                                             if !mentions_bot { continue; }
                                                         }
                                                         AllowBots::All => {
-                                                            // Loop protection: count consecutive bot msgs
+                                                            // Loop protection: count consecutive bot msgs (fail-closed)
                                                             if let Some(thread_ts) = event["thread_ts"].as_str() {
                                                                 let limit_str = (MAX_CONSECUTIVE_BOT_TURNS + 1).to_string();
-                                                                if let Ok(resp) = adapter.api_get(
+                                                                match adapter.api_get(
                                                                     "conversations.replies",
                                                                     &[
                                                                         ("channel", channel_id),
                                                                         ("ts", thread_ts),
                                                                         ("limit", &limit_str),
+                                                                        ("inclusive", "true"),
                                                                     ],
                                                                 ).await {
-                                                                    if let Some(msgs) = resp["messages"].as_array() {
-                                                                        let consecutive = msgs.iter().rev()
-                                                                            .take_while(|m| {
-                                                                                m["bot_id"].is_string()
-                                                                                    || m["subtype"].as_str() == Some("bot_message")
-                                                                            })
-                                                                            .count();
-                                                                        if consecutive >= MAX_CONSECUTIVE_BOT_TURNS {
-                                                                            warn!("bot turn cap reached ({MAX_CONSECUTIVE_BOT_TURNS}), ignoring");
-                                                                            continue;
+                                                                    Ok(resp) => {
+                                                                        if let Some(msgs) = resp["messages"].as_array() {
+                                                                            let consecutive = msgs.iter().rev()
+                                                                                .take_while(|m| {
+                                                                                    m["bot_id"].is_string()
+                                                                                        || m["subtype"].as_str() == Some("bot_message")
+                                                                                })
+                                                                                .count();
+                                                                            if consecutive >= MAX_CONSECUTIVE_BOT_TURNS {
+                                                                                warn!("bot turn cap reached ({MAX_CONSECUTIVE_BOT_TURNS}), ignoring");
+                                                                                continue;
+                                                                            }
                                                                         }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(channel_id, thread_ts, error = %e, "failed to fetch thread for bot loop check, rejecting (fail-closed)");
+                                                                        continue;
                                                                     }
                                                                 }
                                                             }
