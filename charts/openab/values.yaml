@@ -57,7 +57,7 @@ agents:
     #   nodeSelector: {}
     #   tolerations: []
     #   affinity: {}
-    #   image: "ghcr.io/openabdev/openab-claude:latest"
+    #   image: "ghcr.io/openabdev/openab-claude"  # tag omitted → auto-appends appVersion
     # opencode:
     #   command: opencode
     #   args:

@@ -1,5 +1,7 @@
 openab {{ .Chart.AppVersion }} has been installed!
 
+💡 Agent images without an explicit tag (no ":") auto-append {{ .Chart.AppVersion }}.
+
 ⚠️  Channel/user IDs must be set with --set-string (not --set) to avoid float64 precision loss.
 
 Agents deployed:
