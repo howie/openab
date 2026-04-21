@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -361,13 +361,12 @@ impl EventHandler for Handler {
 
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. A message is "in a thread" when the channel
-        // has a parent_id AND the parent is in the allowlist (or allow_all).
+        // type is a thread variant AND the parent is in the allowlist (or allow_all).
         let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc))
-                if matches!(gc.kind, serenity::model::channel::ChannelType::PublicThread
-                    | serenity::model::channel::ChannelType::PrivateThread
-                    | serenity::model::channel::ChannelType::NewsThread) =>
+                if is_thread_channel(gc.kind) =>
             {
+                // parent_id here points from thread → parent channel (not channel → category)
                 let parent_allowed = in_allowed_channel
                     || self.allow_all_channels
                     || gc.parent_id.is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
@@ -882,6 +881,12 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     out.trim().to_string()
 }
 
+/// Returns `true` if the given `ChannelType` is a Discord thread.
+/// Extracted for testability and to centralise thread detection logic.
+fn is_thread_channel(kind: ChannelType) -> bool {
+    matches!(kind, ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread)
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
@@ -1217,5 +1222,47 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
         // No on_human_message (system message filtered out at call site)
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+    }
+
+    // --- is_thread_channel tests (regression for #518) ---
+    // PR #506 used parent_id.is_some() to detect threads, but category text
+    // channels also have parent_id (pointing to the category). This caused
+    // the bot to skip thread creation for normal channels inside categories.
+
+    /// Regression test for #518: a text channel inside a category has parent_id
+    /// set but is NOT a thread — is_thread_channel must return false.
+    #[test]
+    fn category_text_channel_is_not_thread() {
+        assert!(!is_thread_channel(ChannelType::Text));
+    }
+
+    /// Category channel itself is not a thread.
+    #[test]
+    fn category_channel_is_not_thread() {
+        assert!(!is_thread_channel(ChannelType::Category));
+    }
+
+    /// Voice channel is not a thread.
+    #[test]
+    fn voice_channel_is_not_thread() {
+        assert!(!is_thread_channel(ChannelType::Voice));
+    }
+
+    /// PublicThread is correctly detected as a thread.
+    #[test]
+    fn public_thread_is_thread() {
+        assert!(is_thread_channel(ChannelType::PublicThread));
+    }
+
+    /// PrivateThread is correctly detected as a thread.
+    #[test]
+    fn private_thread_is_thread() {
+        assert!(is_thread_channel(ChannelType::PrivateThread));
+    }
+
+    /// NewsThread is correctly detected as a thread.
+    #[test]
+    fn news_thread_is_thread() {
+        assert!(is_thread_channel(ChannelType::NewsThread));
     }
 }
