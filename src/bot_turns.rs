@@ -180,4 +180,15 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
         assert_eq!(t.on_bot_message("t1"), TurnResult::Stopped);
     }
+
+    // System messages (thread created, pin, etc.) must not reset the counter.
+    // Filtering happens at the call site; this verifies the counter stays put
+    // when on_human_message is never called. Regression for openabdev/openab#497.
+    #[test]
+    fn system_message_does_not_reset_counter() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+    }
 }

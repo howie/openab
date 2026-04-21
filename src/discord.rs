@@ -7,10 +7,10 @@ use crate::format;
 use crate::media;
 use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread};
+use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -54,6 +54,23 @@ impl ChatAdapter for DiscordAdapter {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
         })
+    }
+
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        ChannelId::new(ch_id)
+            .edit_message(
+                &self.http,
+                MessageId::new(msg_id),
+                EditMessage::new().content(content),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn use_streaming(&self) -> bool {
+        true
     }
 
     async fn create_thread(
@@ -267,7 +284,9 @@ impl EventHandler for Handler {
                     TurnResult::Throttled => return,
                     TurnResult::Ok => {}
                 }
-            } else {
+            } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
+                && !msg.content.is_empty()
+            {
                 tracker.on_human_message(&thread_key);
             }
         }
@@ -338,36 +357,33 @@ impl EventHandler for Handler {
             }
         }
 
-        // Thread detection: check if the message is in a thread whose parent
-        // is an allowed channel, and whether the bot owns that thread.
-        let (in_thread, bot_owns_thread) = if !in_allowed_channel {
-            match msg.channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let parent_allowed = self.allow_all_channels || gc
-                        .parent_id
-                        .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
-                    tracing::debug!(
-                        channel_id = %msg.channel_id,
-                        parent_id = ?gc.parent_id,
-                        owner_id = ?gc.owner_id,
-                        parent_allowed,
-                        bot_owns = owned,
-                        "thread check"
-                    );
-                    (parent_allowed, owned)
-                }
-                Ok(other) => {
-                    tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                    (false, false)
-                }
-                Err(e) => {
-                    tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                    (false, false)
-                }
+        // Thread detection: single to_channel() call for both allowed and
+        // non-allowed channels. A message is "in a thread" when the channel
+        // has a parent_id AND the parent is in the allowlist (or allow_all).
+        let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) if gc.parent_id.is_some() => {
+                let parent_allowed = in_allowed_channel
+                    || self.allow_all_channels
+                    || gc.parent_id.is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
+                let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+                tracing::debug!(
+                    channel_id = %msg.channel_id,
+                    parent_id = ?gc.parent_id,
+                    owner_id = ?gc.owner_id,
+                    parent_allowed,
+                    bot_owns = owned,
+                    "thread check"
+                );
+                (parent_allowed, owned)
             }
-        } else {
-            (false, false)
+            Ok(other) => {
+                tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
+                (false, false)
+            }
+            Err(e) => {
+                tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                (false, false)
+            }
         };
 
         if !in_allowed_channel && !in_thread {
@@ -454,8 +470,13 @@ impl EventHandler for Handler {
             is_bot: msg.author.bot,
         };
 
-        // Build extra content blocks from attachments (images, audio)
+        // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
         let mut extra_blocks = Vec::new();
+        let mut text_file_bytes: u64 = 0;
+        let mut text_file_count: u32 = 0;
+        const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
+        const TEXT_FILE_COUNT_CAP: u32 = 5;
+
         for attachment in &msg.attachments {
             let mime = attachment.content_type.as_deref().unwrap_or("");
             if media::is_audio_mime(mime) {
@@ -478,6 +499,28 @@ impl EventHandler for Handler {
                     tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
                     let msg_ref = discord_msg_ref(&msg);
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
+                }
+            } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref()) {
+                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                    tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
+                    continue;
+                }
+                // Pre-check with Discord-reported size (fast path, avoids unnecessary download).
+                // Running total uses actual downloaded bytes for accurate accounting.
+                if text_file_bytes + u64::from(attachment.size) > TEXT_TOTAL_CAP {
+                    tracing::warn!(filename = %attachment.filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
+                    continue;
+                }
+                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
+                    &attachment.url,
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                ).await {
+                    text_file_bytes += actual_bytes;
+                    text_file_count += 1;
+                    debug!(filename = %attachment.filename, "adding text file attachment");
+                    extra_blocks.push(block);
                 }
             } else if let Some(block) = media::download_and_encode_image(
                 &attachment.url,
@@ -1026,5 +1069,4 @@ mod tests {
             false,          // other_bot_present
         ));
     }
-
 }
