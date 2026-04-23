@@ -20,7 +20,7 @@ Discord adapter. Requires a Discord bot token.
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore all bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
 | `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). Ignored when `allow_bot_messages = "off"`. |
 | `allow_user_messages` | string | `"involved"` | `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread. |
-| `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. Human message resets the counter. |
+| `max_bot_turns` | u32 | `20` | Max consecutive bot turns per thread before throttling. Human message resets the counter. Note: when `allow_bot_messages = "all"`, a separate hardcoded cap of 10 (`MAX_CONSECUTIVE_BOT_TURNS`) stops bot replies regardless of this value. |
 
 ---
 
@@ -111,7 +111,7 @@ Session pool settings for managing concurrent agent sessions.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. |
+| `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
 
 ---
