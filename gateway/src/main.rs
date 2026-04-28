@@ -568,82 +568,14 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                         // Normal send_message — route by platform
                         if reply.platform == "line" {
                             if let Some(ref access_token) = line_access_token {
-                                // Extract token from cache (drop lock before HTTP call)
-                                let cached_token = {
-                                    let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
-                                    cache
-                                        .remove(&reply.reply_to)
-                                        .and_then(|(token, cached_at)| {
-                                            if cached_at.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS
-                                            {
-                                                Some(token)
-                                            } else {
-                                                info!("LINE replyToken expired, using Push API");
-                                                None
-                                            }
-                                        })
-                                };
-
-                                // Try Reply API first (free, no quota consumed)
-                                let mut used_reply = false;
-                                if let Some(reply_token) = cached_token {
-                                    info!(to = %reply.channel.id, "gateway → line (reply API)");
-                                    let resp = client
-                                        .post("https://api.line.me/v2/bot/message/reply")
-                                        .bearer_auth(access_token)
-                                        .json(&serde_json::json!({
-                                            "replyToken": reply_token,
-                                            "messages": [{"type": "text", "text": reply.content.text}]
-                                        }))
-                                        .send()
-                                        .await;
-                                    match resp {
-                                        Ok(r) if r.status().is_success() => {
-                                            used_reply = true;
-                                        }
-                                        Ok(r) => {
-                                            let status = r.status();
-                                            let body = r.text().await.unwrap_or_default();
-                                            // Only fallback to Push when LINE explicitly says
-                                            // the reply token is unusable (invalid/expired).
-                                            // LINE returns "Invalid reply token" or "expired"
-                                            // in the error body for token-specific failures.
-                                            let body_lower = body.to_lowercase();
-                                            let token_unusable = status.as_u16() == 400
-                                                && ((body_lower.contains("invalid")
-                                                    && body_lower.contains("reply token"))
-                                                    || body_lower.contains("expired"));
-                                            if token_unusable {
-                                                warn!(status = %status, body = %body, "LINE reply token unusable, falling back to Push");
-                                            } else {
-                                                // Ambiguous: 5xx, other 4xx, or unrecognized 400.
-                                                // Message may have been delivered — do NOT fallback.
-                                                error!(status = %status, body = %body, "LINE Reply API error, NOT falling back to Push (possible duplicate risk)");
-                                                used_reply = true;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            // Network/timeout error: delivery ambiguous, do NOT fallback
-                                            error!(err = %e, "LINE Reply API network error, NOT falling back to Push (possible duplicate risk)");
-                                            used_reply = true;
-                                        }
-                                    }
-                                }
-
-                                // Fallback to Push API
-                                if !used_reply {
-                                    info!(to = %reply.channel.id, "gateway → line (push API)");
-                                    let _ = client
-                                        .post("https://api.line.me/v2/bot/message/push")
-                                        .bearer_auth(access_token)
-                                        .json(&serde_json::json!({
-                                            "to": reply.channel.id,
-                                            "messages": [{"type": "text", "text": reply.content.text}]
-                                        }))
-                                        .send()
-                                        .await
-                                        .map_err(|e| error!("line push error: {e}"));
-                                }
+                                dispatch_line_reply(
+                                    &client,
+                                    access_token,
+                                    &reply_cache,
+                                    &reply,
+                                    LINE_API_BASE,
+                                )
+                                .await;
                             }
                         } else {
                             // Telegram sendMessage
@@ -674,6 +606,90 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         _ = recv_task => {},
     }
     info!("OAB client disconnected");
+}
+
+/// Base URL for LINE Messaging API. Overridden in tests via the `api_base` parameter.
+const LINE_API_BASE: &str = "https://api.line.me";
+
+/// Dispatch a reply to LINE using the hybrid Reply/Push strategy.
+///
+/// Returns `true` if Reply API was used (or assumed used), `false` if Push API was used.
+async fn dispatch_line_reply(
+    client: &reqwest::Client,
+    access_token: &str,
+    reply_cache: &ReplyTokenCache,
+    reply: &GatewayReply,
+    api_base: &str,
+) -> bool {
+    // Extract token from cache (drop lock before HTTP call)
+    let cached_token = {
+        let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .remove(&reply.reply_to)
+            .and_then(|(token, cached_at)| {
+                if cached_at.elapsed().as_secs() < REPLY_TOKEN_TTL_SECS {
+                    Some(token)
+                } else {
+                    info!("LINE replyToken expired, using Push API");
+                    None
+                }
+            })
+    };
+
+    // Try Reply API first (free, no quota consumed)
+    let mut used_reply = false;
+    if let Some(reply_token) = cached_token {
+        info!(to = %reply.channel.id, "gateway → line (reply API)");
+        let resp = client
+            .post(format!("{}/v2/bot/message/reply", api_base))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "replyToken": reply_token,
+                "messages": [{"type": "text", "text": reply.content.text}]
+            }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                used_reply = true;
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let body_lower = body.to_lowercase();
+                let token_unusable = status.as_u16() == 400
+                    && ((body_lower.contains("invalid") && body_lower.contains("reply token"))
+                        || body_lower.contains("expired"));
+                if token_unusable {
+                    warn!(status = %status, body = %body, "LINE reply token unusable, falling back to Push");
+                } else {
+                    error!(status = %status, body = %body, "LINE Reply API error, NOT falling back to Push (possible duplicate risk)");
+                    used_reply = true;
+                }
+            }
+            Err(e) => {
+                error!(err = %e, "LINE Reply API network error, NOT falling back to Push (possible duplicate risk)");
+                used_reply = true;
+            }
+        }
+    }
+
+    // Fallback to Push API
+    if !used_reply {
+        info!(to = %reply.channel.id, "gateway → line (push API)");
+        let _ = client
+            .post(format!("{}/v2/bot/message/push", api_base))
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "to": reply.channel.id,
+                "messages": [{"type": "text", "text": reply.content.text}]
+            }))
+            .send()
+            .await
+            .map_err(|e| error!("line push error: {e}"));
+    }
+
+    used_reply
 }
 
 // --- Health check ---
@@ -752,4 +768,202 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_reply(event_id: &str) -> GatewayReply {
+        GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: event_id.into(),
+            platform: "line".into(),
+            channel: ReplyChannel { id: "U1234".into(), thread_id: None },
+            content: Content { content_type: "text".into(), text: "hello".into() },
+            command: None,
+            request_id: None,
+        }
+    }
+
+    fn make_cache() -> ReplyTokenCache {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Cache hit: uses Reply API with correct replyToken, bearer token, and message body.
+    /// Does NOT call Push API.
+    #[tokio::test]
+    async fn cache_hit_uses_reply_api() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .and(body_json(serde_json::json!({
+                "replyToken": "tok_abc",
+                "messages": [{"type": "text", "text": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+        cache.lock().unwrap().insert("evt_1".into(), ("tok_abc".into(), Instant::now()));
+
+        let client = reqwest::Client::new();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_1"), &server.uri()).await;
+
+        assert!(used, "should report Reply API was used");
+    }
+
+    /// Cache miss: falls back to Push API with correct "to", bearer token, and message body.
+    #[tokio::test]
+    async fn cache_miss_uses_push_api() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .and(body_json(serde_json::json!({
+                "to": "U1234",
+                "messages": [{"type": "text", "text": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+
+        let client = reqwest::Client::new();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_miss"), &server.uri()).await;
+
+        assert!(!used, "should report Push API was used (no reply token)");
+    }
+
+    /// Expired cached token: falls back to Push API.
+    #[tokio::test]
+    async fn expired_token_uses_push_api() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .and(body_json(serde_json::json!({
+                "to": "U1234",
+                "messages": [{"type": "text", "text": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+        let expired_time = Instant::now() - Duration::from_secs(REPLY_TOKEN_TTL_SECS + 10);
+        cache.lock().unwrap().insert("evt_exp".into(), ("tok_old".into(), expired_time));
+
+        let client = reqwest::Client::new();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_exp"), &server.uri()).await;
+
+        assert!(!used, "should report Push API was used (expired token)");
+    }
+
+    /// Reply API 400 with invalid/expired reply token: falls back to Push API.
+    #[tokio::test]
+    async fn reply_400_invalid_token_falls_back_to_push() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"message":"Invalid reply token"}"#),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .and(body_json(serde_json::json!({
+                "to": "U1234",
+                "messages": [{"type": "text", "text": "hello"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+        cache.lock().unwrap().insert("evt_400".into(), ("tok_bad".into(), Instant::now()));
+
+        let client = reqwest::Client::new();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_400"), &server.uri()).await;
+
+        assert!(!used, "should fall back to Push on 400 invalid token");
+    }
+
+    /// Reply API 5xx: does NOT fall back to Push (duplicate risk).
+    #[tokio::test]
+    async fn reply_5xx_does_not_fallback() {
+        let server = MockServer::start().await;
+        let _reply = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .and(header("authorization", "Bearer test_access_token"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _push = Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let cache = make_cache();
+        cache.lock().unwrap().insert("evt_5xx".into(), ("tok_5xx".into(), Instant::now()));
+
+        let client = reqwest::Client::new();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_5xx"), &server.uri()).await;
+
+        assert!(used, "should NOT fall back to Push on 5xx");
+    }
+
+    /// Reply API network/timeout error: does NOT fall back to Push (duplicate risk).
+    #[tokio::test]
+    async fn reply_network_error_does_not_fallback() {
+        let bad_base = "http://127.0.0.1:1";
+
+        let cache = make_cache();
+        cache.lock().unwrap().insert("evt_net".into(), ("tok_net".into(), Instant::now()));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let used = dispatch_line_reply(&client, "test_access_token", &cache, &make_reply("evt_net"), bad_base).await;
+
+        assert!(used, "should NOT fall back to Push on network error");
+    }
 }
