@@ -74,23 +74,21 @@ fn hex_prefix(body: &[u8]) -> String {
         .concat()
 }
 
-/// Allowed MIME types for model-bound images.
-const ALLOWED_IMAGE_MIME: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
-
 /// Validate the HTTP response Content-Type and body magic bytes.
 ///
-/// Returns the detected `ImageFormat` on success.  Both checks are applied:
-/// the Content-Type allow-list rejects non-image responses early (e.g. Slack
-/// serving an HTML login page when `files:read` scope is missing), and the
-/// magic-byte sniff catches corrupted or mislabeled bodies regardless of the
-/// header.
+/// If Content-Type is present and explicitly non-binary (e.g. `text/html` from
+/// Slack's auth redirect when `files:read` scope is missing), rejects immediately.
+/// Generic types such as `application/octet-stream` and absent headers pass through
+/// to the magic-byte check, which is the authoritative gate for image validity.
 fn validate_image_response(
     content_type: Option<&str>,
     body: &[u8],
 ) -> Result<image::ImageFormat, MediaFetchError> {
+    // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
+    // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
         let base = strip_mime_params(ct).to_lowercase();
-        if !ALLOWED_IMAGE_MIME.contains(&base.as_str()) {
+        if base.starts_with("text/") {
             return Err(MediaFetchError::UnsupportedResponseType {
                 actual: Some(base),
             });
@@ -99,7 +97,8 @@ fn validate_image_response(
 
     let reader = match ImageReader::new(Cursor::new(body)).with_guessed_format() {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
+            error!(error = %e, "image format detection I/O error");
             return Err(MediaFetchError::InvalidImageBody {
                 magic_prefix_hex: hex_prefix(body),
             });
@@ -122,9 +121,11 @@ fn validate_image_response(
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
 ///
 /// Returns `Err(MediaFetchError::NotAnImage)` when the URL or MIME hint don't
-/// indicate an image (silent skip).  Returns other `Err` variants when the
-/// download succeeded but the response bytes fail Content-Type or magic-byte
-/// validation — callers should surface these to the user.
+/// indicate an image — callers should skip silently.  Returns
+/// `Err(MediaFetchError::SizeExceeded)` when the declared `size` exceeds the limit
+/// before any request is made.  Returns other `Err` variants (`Network`,
+/// `HttpStatus`, `UnsupportedResponseType`, `InvalidImageBody`) after a request
+/// attempt — callers should surface these to the user.
 ///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 pub async fn download_and_encode_image(
@@ -211,7 +212,8 @@ pub async fn download_and_encode_image(
         });
     }
 
-    // Validate Content-Type and magic bytes before processing.
+    // Guard against HTTP 200 responses that are error pages (e.g. Slack auth redirect
+    // when files:read scope is missing), and against corrupted or mislabeled bodies.
     if let Err(e) = validate_image_response(content_type.as_deref(), &bytes) {
         error!(
             filename,
@@ -634,13 +636,38 @@ mod tests {
         ));
     }
 
+    /// Regression test for the application/octet-stream fix: CDNs and generic
+    /// file download endpoints commonly serve any file with this Content-Type.
+    /// The old allow-list incorrectly rejected it before magic-byte check.
     #[test]
-    fn validate_rejects_application_json_content_type() {
+    fn validate_accepts_octet_stream_with_valid_png() {
         let png = make_png(1, 1);
-        let result = validate_image_response(Some("application/json"), &png);
+        assert!(
+            validate_image_response(Some("application/octet-stream"), &png).is_ok(),
+            "application/octet-stream must pass through to magic-byte check"
+        );
+    }
+
+    /// application/json body is rejected by magic bytes, not by Content-Type.
+    #[test]
+    fn validate_rejects_json_body_by_magic_bytes() {
+        let json_body = b"{\"error\":\"invalid_auth\",\"ok\":false}";
+        let result = validate_image_response(Some("application/json"), json_body);
         assert!(matches!(
             result,
-            Err(MediaFetchError::UnsupportedResponseType { .. })
+            Err(MediaFetchError::InvalidImageBody { .. })
+        ));
+    }
+
+    /// Missing Content-Type with invalid body: CDN stripping the header should
+    /// still be caught by magic-byte detection.
+    #[test]
+    fn validate_rejects_html_body_with_missing_content_type() {
+        let html_body = b"<!DOCTYPE html><html><body>error page</body></html>";
+        let result = validate_image_response(None, html_body);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::InvalidImageBody { .. })
         ));
     }
 

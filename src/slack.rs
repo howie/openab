@@ -1048,13 +1048,17 @@ async fn handle_message(
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                        warn!(filename, actual, limit, "image exceeds size limit");
+                        failed_image_files.push(format!("{filename} (exceeds {limit} byte limit)"));
+                    }
                     Err(
                         media::MediaFetchError::UnsupportedResponseType { .. }
                         | media::MediaFetchError::InvalidImageBody { .. },
                     ) => {
                         warn!(
                             filename,
-                            "image validation failed; server may have returned HTML (missing files:read scope?)"
+                            "image validation failed; server may have returned non-image content"
                         );
                         failed_image_files.push(filename.to_string());
                     }
@@ -1066,7 +1070,7 @@ async fn handle_message(
         }
     }
 
-    // Notify user if any images couldn't be validated (likely missing files:read scope).
+    // Notify user if any images couldn't be processed.
     if !failed_image_files.is_empty() {
         let warn_channel = ChannelRef {
             platform: "slack".into(),
@@ -1076,16 +1080,14 @@ async fn handle_message(
             origin_event_id: None,
         };
         let file_list = failed_image_files.join("`, `");
-        let _ = adapter
-            .send_message(
-                &warn_channel,
-                &format!(
-                    ":warning: I couldn't access the file(s) you shared (`{file_list}`). \
-                     This often means the bot is missing the `files:read` OAuth scope. \
-                     Please ask an admin to reinstall the app with that scope."
-                ),
-            )
-            .await;
+        let msg = format!(
+            ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
+             This can happen when the bot lacks the `files:read` OAuth scope, \
+             or when the file format isn't supported (PNG/JPEG/GIF/WebP only)."
+        );
+        if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
+            warn!(error = %e, "failed to send image validation warning to user");
+        }
     }
 
     // Resolve Slack display name (best-effort, fallback to user_id)
@@ -1205,6 +1207,10 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
+/// Strip MIME parameters so type-detection helpers see the bare media type.
+/// Delegates to media::strip_mime_params (single source of truth).
+/// Needed because Slack occasionally sends `text/plain; charset=utf-8` and
+/// `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
     media::strip_mime_params(mimetype)
 }
