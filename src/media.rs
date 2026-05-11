@@ -27,10 +27,7 @@ pub enum MediaFetchError {
     /// URL empty or MIME/filename doesn't indicate an image; skip silently.
     NotAnImage,
     /// HTTP response Content-Type is not a supported image format.
-    UnsupportedResponseType {
-        hinted: Option<String>,
-        actual: Option<String>,
-    },
+    UnsupportedResponseType { actual: Option<String> },
     /// Response body magic bytes don't match a supported image format.
     InvalidImageBody { magic_prefix_hex: String },
     /// File exceeds the configured size limit.
@@ -45,10 +42,9 @@ impl std::fmt::Display for MediaFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAnImage => write!(f, "not an image attachment"),
-            Self::UnsupportedResponseType { hinted, actual } => write!(
+            Self::UnsupportedResponseType { actual } => write!(
                 f,
-                "server returned unexpected content type (hinted: {}, actual: {})",
-                hinted.as_deref().unwrap_or("none"),
+                "server returned unexpected content type (actual: {})",
                 actual.as_deref().unwrap_or("none"),
             ),
             Self::InvalidImageBody { magic_prefix_hex } => write!(
@@ -62,6 +58,11 @@ impl std::fmt::Display for MediaFetchError {
             Self::HttpStatus(s) => write!(f, "HTTP {s}"),
         }
     }
+}
+
+/// Strip MIME parameters and trim whitespace.  `"image/png; charset=binary"` → `"image/png"`.
+pub(crate) fn strip_mime_params(mime: &str) -> &str {
+    mime.split(';').next().unwrap_or(mime).trim()
 }
 
 /// Format the first 8 bytes of a buffer as lowercase hex (no separator).
@@ -88,10 +89,9 @@ fn validate_image_response(
     body: &[u8],
 ) -> Result<image::ImageFormat, MediaFetchError> {
     if let Some(ct) = content_type {
-        let base = ct.split(';').next().unwrap_or(ct).trim().to_lowercase();
+        let base = strip_mime_params(ct).to_lowercase();
         if !ALLOWED_IMAGE_MIME.contains(&base.as_str()) {
             return Err(MediaFetchError::UnsupportedResponseType {
-                hinted: None,
                 actual: Some(base),
             });
         }
@@ -108,11 +108,11 @@ fn validate_image_response(
 
     match reader.format() {
         Some(
-            image::ImageFormat::Png
-            | image::ImageFormat::Jpeg
-            | image::ImageFormat::Gif
-            | image::ImageFormat::WebP,
-        ) => Ok(reader.format().unwrap()),
+            fmt @ (image::ImageFormat::Png
+                | image::ImageFormat::Jpeg
+                | image::ImageFormat::Gif
+                | image::ImageFormat::WebP),
+        ) => Ok(fmt),
         _ => Err(MediaFetchError::InvalidImageBody {
             magic_prefix_hex: hex_prefix(body),
         }),
@@ -227,15 +227,16 @@ pub async fn download_and_encode_image(
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
+            let magic = hex_prefix(&bytes);
             error!(
                 filename,
                 error = %e,
-                magic = hex_prefix(&bytes),
+                magic = %magic,
                 size = bytes.len(),
                 "resize failed after successful validation"
             );
             return Err(MediaFetchError::InvalidImageBody {
-                magic_prefix_hex: hex_prefix(&bytes),
+                magic_prefix_hex: magic,
             });
         }
     };
@@ -667,7 +668,6 @@ mod tests {
     fn media_fetch_error_display_renders() {
         let _ = MediaFetchError::NotAnImage.to_string();
         let _ = MediaFetchError::UnsupportedResponseType {
-            hinted: Some("image/png".into()),
             actual: Some("text/html".into()),
         }
         .to_string();

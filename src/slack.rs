@@ -1205,11 +1205,8 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
-/// Strip MIME parameters like `; charset=utf-8` so type-detection helpers see
-/// the bare media type. Slack occasionally sends mimetypes like
-/// `text/plain; charset=utf-8`; `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
-    mimetype.split(';').next().unwrap_or(mimetype).trim()
+    media::strip_mime_params(mimetype)
 }
 
 /// True only when a Slack non-bot event represents a real user message
