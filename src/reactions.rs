@@ -339,3 +339,314 @@ fn cancel_timers(inner: &mut Inner) {
         h.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::ChannelRef;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    /// Mock adapter that records `send_message` calls so heartbeat assertions
+    /// can verify what was posted into the thread.
+    #[derive(Default)]
+    struct RecordingAdapter {
+        sent: StdMutex<Vec<(ChannelRef, String)>>,
+    }
+
+    impl RecordingAdapter {
+        fn sent_count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+        fn sent_messages(&self) -> Vec<(ChannelRef, String)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(
+            &self,
+            channel: &ChannelRef,
+            content: &str,
+        ) -> Result<MessageRef> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((channel.clone(), content.to_string()));
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "sent".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    fn test_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "test".into(),
+            channel_id: "C_test".into(),
+            thread_id: Some("T_test".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn test_message() -> MessageRef {
+        MessageRef {
+            channel: test_channel(),
+            message_id: "M_trigger".into(),
+        }
+    }
+
+    /// Build a `ReactionTiming` with soft/hard stall pushed out of reach so
+    /// they don't interfere with heartbeat assertions, then layer in the
+    /// heartbeat config under test.
+    fn timing_for_heartbeat(text_ms: u64, repeat: bool) -> ReactionTiming {
+        ReactionTiming {
+            stall_soft_ms: 60 * 60 * 1000,
+            stall_hard_ms: 60 * 60 * 1000,
+            stall_text_ms: Some(text_ms),
+            stall_text_repeat: repeat,
+            ..ReactionTiming::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_fires_after_stall_text_ms() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing_for_heartbeat(60_000, false),
+        );
+        ctrl.set_thinking().await;
+        assert_eq!(adapter.sent_count(), 0);
+
+        tokio::time::sleep(Duration::from_millis(60_500)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            1,
+            "heartbeat should fire once after the configured window"
+        );
+        let (channel, content) = adapter.sent_messages().into_iter().next().unwrap();
+        assert_eq!(channel.channel_id, "C_test");
+        assert_eq!(channel.thread_id.as_deref(), Some("T_test"));
+        assert!(
+            content.contains("still working"),
+            "expected default template substring, got: {content}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_disabled_when_stall_text_ms_is_none() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let timing = ReactionTiming {
+            stall_soft_ms: 60 * 60 * 1000,
+            stall_hard_ms: 60 * 60 * 1000,
+            ..ReactionTiming::default()
+        };
+        assert!(timing.stall_text_ms.is_none(), "regression: default must keep heartbeat off");
+
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing,
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            0,
+            "no heartbeat should fire when stall_text_ms is None"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_resets_on_acp_event() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing_for_heartbeat(60_000, false),
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_millis(50_000)).await;
+        ctrl.set_tool("read").await;
+        tokio::time::sleep(Duration::from_millis(50_000)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            0,
+            "event before threshold should reset the heartbeat timer"
+        );
+
+        tokio::time::sleep(Duration::from_millis(15_000)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            adapter.sent_count(),
+            1,
+            "heartbeat should fire 60s after the most recent event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_repeats_when_repeat_true() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing_for_heartbeat(60_000, true),
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_millis(60_000 * 3 + 1_000)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            3,
+            "expected 3 heartbeats over 3 windows when repeat=true"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_does_not_repeat_when_repeat_false() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing_for_heartbeat(60_000, false),
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_millis(60_000 * 5)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            1,
+            "should fire exactly once when repeat=false"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_template_substitutes_elapsed() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let timing = ReactionTiming {
+            stall_text_template: Some("hi · {elapsed}".into()),
+            ..timing_for_heartbeat(60_000, false)
+        };
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing,
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_millis(60_100)).await;
+        tokio::task::yield_now().await;
+
+        let messages = adapter.sent_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].1, "hi · 1m",
+            "expected substituted elapsed in custom template"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_cancelled_after_set_done() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            test_message(),
+            test_channel(),
+            ReactionEmojis::default(),
+            timing_for_heartbeat(60_000, true),
+        );
+        ctrl.set_thinking().await;
+
+        tokio::time::sleep(Duration::from_millis(30_000)).await;
+        ctrl.set_done().await;
+
+        tokio::time::sleep(Duration::from_millis(60_000 * 10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            adapter.sent_count(),
+            0,
+            "no heartbeat should fire after set_done cancels timers"
+        );
+    }
+
+    #[test]
+    fn format_elapsed_seconds_range() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(45)), "45s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_elapsed_minutes_range() {
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m");
+        assert_eq!(format_elapsed(Duration::from_secs(11 * 60)), "11m");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m");
+    }
+
+    #[test]
+    fn format_elapsed_hours_range() {
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h0m");
+        assert_eq!(format_elapsed(Duration::from_secs(3600 + 12 * 60)), "1h12m");
+        assert_eq!(format_elapsed(Duration::from_secs(2 * 3600 + 30 * 60)), "2h30m");
+    }
+}

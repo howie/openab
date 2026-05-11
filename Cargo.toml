@@ -35,3 +35,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Enables `tokio::time::pause` / `advance` and `#[tokio::test(start_paused = true)]`
+# for deterministic timing assertions in reactions::tests.
+tokio = { version = "1", features = ["test-util"] }
