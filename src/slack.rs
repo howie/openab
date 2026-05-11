@@ -1079,7 +1079,15 @@ async fn handle_message(
             parent_id: None,
             origin_event_id: None,
         };
-        let file_list = failed_image_files.join("`, `");
+        // Sanitize filenames before embedding in mrkdwn: backticks and angle-
+        // bracket sequences (`<@U...>`, `<!here>`) are Slack markup delimiters
+        // that would allow injection if the filename is user-controlled.
+        let sanitize = |s: &str| s.replace('`', "'").replace('<', "(").replace('>', ")");
+        let file_list = failed_image_files
+            .iter()
+            .map(|n| sanitize(n))
+            .collect::<Vec<_>>()
+            .join("`, `");
         let msg = format!(
             ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
              This can happen when the bot lacks the `files:read` OAuth scope, \
