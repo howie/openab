@@ -934,6 +934,7 @@ async fn handle_message(
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
+    let mut failed_image_files: Vec<String> = Vec::new();
 
     if let Some(files) = files {
         for file in files {
@@ -1032,19 +1033,59 @@ async fn handle_message(
                     debug!(filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
-                url,
-                Some(mimetype),
-                filename,
-                size,
-                Some(bot_token),
-            )
-            .await
-            {
-                debug!(filename, "adding image attachment");
-                extra_blocks.push(block);
+            } else {
+                match media::download_and_encode_image(
+                    url,
+                    Some(mimetype),
+                    filename,
+                    size,
+                    Some(bot_token),
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(
+                        media::MediaFetchError::UnsupportedResponseType { .. }
+                        | media::MediaFetchError::InvalidImageBody { .. },
+                    ) => {
+                        warn!(
+                            filename,
+                            "image validation failed; server may have returned HTML (missing files:read scope?)"
+                        );
+                        failed_image_files.push(filename.to_string());
+                    }
+                    Err(e) => {
+                        warn!(filename, error = %e, "image download failed");
+                    }
+                }
             }
         }
+    }
+
+    // Notify user if any images couldn't be validated (likely missing files:read scope).
+    if !failed_image_files.is_empty() {
+        let warn_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: channel_id.clone(),
+            thread_id: thread_ts.clone().or_else(|| Some(ts.clone())),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let file_list = failed_image_files.join("`, `");
+        let _ = adapter
+            .send_message(
+                &warn_channel,
+                &format!(
+                    ":warning: I couldn't access the file(s) you shared (`{file_list}`). \
+                     This often means the bot is missing the `files:read` OAuth scope. \
+                     Please ask an admin to reinstall the app with that scope."
+                ),
+            )
+            .await;
     }
 
     // Resolve Slack display name (best-effort, fallback to user_id)

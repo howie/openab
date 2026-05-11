@@ -21,7 +21,111 @@ const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 /// JPEG quality for compressed output.
 const IMAGE_JPEG_QUALITY: u8 = 75;
 
+/// Error variants for `download_and_encode_image`.
+#[derive(Debug)]
+pub enum MediaFetchError {
+    /// URL empty or MIME/filename doesn't indicate an image; skip silently.
+    NotAnImage,
+    /// HTTP response Content-Type is not a supported image format.
+    UnsupportedResponseType {
+        hinted: Option<String>,
+        actual: Option<String>,
+    },
+    /// Response body magic bytes don't match a supported image format.
+    InvalidImageBody { magic_prefix_hex: String },
+    /// File exceeds the configured size limit.
+    SizeExceeded { actual: u64, limit: u64 },
+    /// Network-level error (send or body-read).
+    Network(reqwest::Error),
+    /// Server returned a non-success HTTP status.
+    HttpStatus(reqwest::StatusCode),
+}
+
+impl std::fmt::Display for MediaFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnImage => write!(f, "not an image attachment"),
+            Self::UnsupportedResponseType { hinted, actual } => write!(
+                f,
+                "server returned unexpected content type (hinted: {}, actual: {})",
+                hinted.as_deref().unwrap_or("none"),
+                actual.as_deref().unwrap_or("none"),
+            ),
+            Self::InvalidImageBody { magic_prefix_hex } => write!(
+                f,
+                "response body is not a valid image (first 8 bytes: {magic_prefix_hex})"
+            ),
+            Self::SizeExceeded { actual, limit } => {
+                write!(f, "file size {actual} exceeds limit {limit}")
+            }
+            Self::Network(e) => write!(f, "network error: {e}"),
+            Self::HttpStatus(s) => write!(f, "HTTP {s}"),
+        }
+    }
+}
+
+/// Format the first 8 bytes of a buffer as lowercase hex (no separator).
+fn hex_prefix(body: &[u8]) -> String {
+    body.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// Allowed MIME types for model-bound images.
+const ALLOWED_IMAGE_MIME: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Validate the HTTP response Content-Type and body magic bytes.
+///
+/// Returns the detected `ImageFormat` on success.  Both checks are applied:
+/// the Content-Type allow-list rejects non-image responses early (e.g. Slack
+/// serving an HTML login page when `files:read` scope is missing), and the
+/// magic-byte sniff catches corrupted or mislabeled bodies regardless of the
+/// header.
+fn validate_image_response(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<image::ImageFormat, MediaFetchError> {
+    if let Some(ct) = content_type {
+        let base = ct.split(';').next().unwrap_or(ct).trim().to_lowercase();
+        if !ALLOWED_IMAGE_MIME.contains(&base.as_str()) {
+            return Err(MediaFetchError::UnsupportedResponseType {
+                hinted: None,
+                actual: Some(base),
+            });
+        }
+    }
+
+    let reader = match ImageReader::new(Cursor::new(body)).with_guessed_format() {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(MediaFetchError::InvalidImageBody {
+                magic_prefix_hex: hex_prefix(body),
+            });
+        }
+    };
+
+    match reader.format() {
+        Some(
+            image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP,
+        ) => Ok(reader.format().unwrap()),
+        _ => Err(MediaFetchError::InvalidImageBody {
+            magic_prefix_hex: hex_prefix(body),
+        }),
+    }
+}
+
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
+///
+/// Returns `Err(MediaFetchError::NotAnImage)` when the URL or MIME hint don't
+/// indicate an image (silent skip).  Returns other `Err` variants when the
+/// download succeeded but the response bytes fail Content-Type or magic-byte
+/// validation — callers should surface these to the user.
+///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 pub async fn download_and_encode_image(
     url: &str,
@@ -29,11 +133,11 @@ pub async fn download_and_encode_image(
     filename: &str,
     size: u64,
     auth_token: Option<&str>,
-) -> Option<ContentBlock> {
+) -> Result<ContentBlock, MediaFetchError> {
     const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
     if url.is_empty() {
-        return None;
+        return Err(MediaFetchError::NotAnImage);
     }
 
     let mime = mime_hint.or_else(|| {
@@ -51,17 +155,20 @@ pub async fn download_and_encode_image(
 
     let Some(mime) = mime else {
         debug!(filename, "skipping non-image attachment");
-        return None;
+        return Err(MediaFetchError::NotAnImage);
     };
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     if !mime.starts_with("image/") {
         debug!(filename, mime, "skipping non-image attachment");
-        return None;
+        return Err(MediaFetchError::NotAnImage);
     }
 
     if size > MAX_SIZE {
         error!(filename, size, "image exceeds 10MB limit");
-        return None;
+        return Err(MediaFetchError::SizeExceeded {
+            actual: size,
+            limit: MAX_SIZE,
+        });
     }
 
     let mut req = HTTP_CLIENT.get(url);
@@ -73,39 +180,63 @@ pub async fn download_and_encode_image(
         Ok(resp) => resp,
         Err(e) => {
             error!(url, error = %e, "download failed");
-            return None;
+            return Err(MediaFetchError::Network(e));
         }
     };
     if !response.status().is_success() {
         error!(url, status = %response.status(), "HTTP error downloading image");
-        return None;
+        return Err(MediaFetchError::HttpStatus(response.status()));
     }
+
+    // Capture Content-Type BEFORE .bytes() consumes the response.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     let bytes = match response.bytes().await {
         Ok(b) => b,
         Err(e) => {
             error!(url, error = %e, "read failed");
-            return None;
+            return Err(MediaFetchError::Network(e));
         }
     };
 
     if bytes.len() as u64 > MAX_SIZE {
+        error!(filename, size = bytes.len(), "downloaded image exceeds limit");
+        return Err(MediaFetchError::SizeExceeded {
+            actual: bytes.len() as u64,
+            limit: MAX_SIZE,
+        });
+    }
+
+    // Validate Content-Type and magic bytes before processing.
+    if let Err(e) = validate_image_response(content_type.as_deref(), &bytes) {
         error!(
             filename,
-            size = bytes.len(),
-            "downloaded image exceeds limit"
+            mime_hint = mime,
+            content_type = content_type.as_deref().unwrap_or("none"),
+            magic = hex_prefix(&bytes),
+            error = %e,
+            "image validation failed — body is not a supported image"
         );
-        return None;
+        return Err(e);
     }
 
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
-            if bytes.len() > 1024 * 1024 {
-                error!(filename, error = %e, size = bytes.len(), "resize failed and original too large, skipping");
-                return None;
-            }
-            debug!(filename, error = %e, "resize failed, using original");
-            (bytes.to_vec(), mime.to_string())
+            error!(
+                filename,
+                error = %e,
+                magic = hex_prefix(&bytes),
+                size = bytes.len(),
+                "resize failed after successful validation"
+            );
+            return Err(MediaFetchError::InvalidImageBody {
+                magic_prefix_hex: hex_prefix(&bytes),
+            });
         }
     };
 
@@ -117,7 +248,7 @@ pub async fn download_and_encode_image(
     );
 
     let encoded = BASE64.encode(&output_bytes);
-    Some(ContentBlock::Image {
+    Ok(ContentBlock::Image {
         media_type: output_mime,
         data: encoded,
     })
@@ -348,6 +479,13 @@ mod tests {
         buf.into_inner()
     }
 
+    fn make_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::new(width, height);
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
     #[test]
     fn large_image_resized_to_max_dimension() {
         let png = make_png(3000, 2000);
@@ -428,5 +566,132 @@ mod tests {
         assert!(is_video_file("clip.mp4", None));
         assert!(is_video_file("clip.MOV", None));
         assert!(!is_video_file("notes.txt", Some("text/plain")));
+    }
+
+    // --- validate_image_response tests ---
+
+    #[test]
+    fn validate_accepts_png_with_matching_content_type() {
+        let png = make_png(1, 1);
+        assert!(validate_image_response(Some("image/png"), &png).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_jpeg_with_matching_content_type() {
+        let jpeg = make_jpeg(1, 1);
+        assert!(validate_image_response(Some("image/jpeg"), &jpeg).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_gif_with_matching_content_type() {
+        let gif: Vec<u8> = vec![
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+            0x3B,
+        ];
+        assert!(validate_image_response(Some("image/gif"), &gif).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_missing_content_type_with_valid_png() {
+        // When Content-Type header is absent, fall back to magic-byte detection.
+        let png = make_png(1, 1);
+        assert!(validate_image_response(None, &png).is_ok());
+    }
+
+    #[test]
+    fn validate_content_type_strips_params() {
+        // "image/png; charset=binary" is a real header value — must be accepted.
+        let png = make_png(1, 1);
+        assert!(validate_image_response(Some("image/png; charset=binary"), &png).is_ok());
+    }
+
+    /// Exact reproduction of issue #776: Slack serves the workspace login HTML
+    /// page at HTTP 200 when the bot token lacks the `files:read` scope.
+    /// The Slack file metadata says `mimetype: image/png`; the response body
+    /// magic bytes are `<!DOCTYP` (0x3c 0x21 0x44 0x4f 0x43 0x54 0x59 0x50).
+    #[test]
+    fn validate_rejects_html_body_labeled_as_image_png() {
+        let html_body = b"<!DOCTYPE html><html><head></head><body>Slack login</body></html>";
+        let result = validate_image_response(Some("image/png"), html_body);
+        match result {
+            Err(MediaFetchError::InvalidImageBody { magic_prefix_hex }) => {
+                assert_eq!(magic_prefix_hex, "3c21444f43545950");
+            }
+            other => panic!("expected InvalidImageBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_text_html_content_type() {
+        // Even if the body were a valid image, a text/html Content-Type must be rejected.
+        let png = make_png(1, 1);
+        let result = validate_image_response(Some("text/html; charset=utf-8"), &png);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::UnsupportedResponseType { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_application_json_content_type() {
+        let png = make_png(1, 1);
+        let result = validate_image_response(Some("application/json"), &png);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::UnsupportedResponseType { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_body() {
+        let result = validate_image_response(Some("image/png"), &[]);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::InvalidImageBody { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_truncated_png_header() {
+        // PNG magic is 8 bytes; 4 bytes is not enough to identify the format.
+        let truncated = [0x89u8, 0x50, 0x4e, 0x47];
+        let result = validate_image_response(Some("image/png"), &truncated);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::InvalidImageBody { .. })
+        ));
+    }
+
+    #[test]
+    fn media_fetch_error_display_renders() {
+        let _ = MediaFetchError::NotAnImage.to_string();
+        let _ = MediaFetchError::UnsupportedResponseType {
+            hinted: Some("image/png".into()),
+            actual: Some("text/html".into()),
+        }
+        .to_string();
+        let _ = MediaFetchError::InvalidImageBody {
+            magic_prefix_hex: "3c21444f43545950".into(),
+        }
+        .to_string();
+        let _ = MediaFetchError::SizeExceeded {
+            actual: 11_000_000,
+            limit: 10_000_000,
+        }
+        .to_string();
+        let _ = MediaFetchError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED).to_string();
+    }
+
+    #[test]
+    fn hex_prefix_formats_first_8_bytes() {
+        let bytes = b"<!DOCTYPE html>";
+        assert_eq!(hex_prefix(bytes), "3c21444f43545950");
+    }
+
+    #[test]
+    fn hex_prefix_handles_short_buffer() {
+        let bytes = [0xffu8, 0xd8];
+        assert_eq!(hex_prefix(&bytes), "ffd8");
     }
 }

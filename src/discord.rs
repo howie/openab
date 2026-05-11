@@ -702,25 +702,43 @@ impl EventHandler for Handler {
                     debug!(filename = %attachment.filename, "adding text file attachment");
                     extra_blocks.push(block);
                 }
-            } else if let Some(block) = media::download_and_encode_image(
-                &attachment.url,
-                attachment.content_type.as_deref(),
-                &attachment.filename,
-                u64::from(attachment.size),
-                None,
-            )
-            .await
-            {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                extra_blocks.push(block);
-            } else if media::is_video_file(&attachment.filename, attachment.content_type.as_deref()) {
-                debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
-                extra_blocks.push(video_attachment_block(
-                    &attachment.filename,
-                    attachment.content_type.as_deref(),
-                    u64::from(attachment.size),
+            } else {
+                match media::download_and_encode_image(
                     &attachment.url,
-                ));
+                    attachment.content_type.as_deref(),
+                    &attachment.filename,
+                    u64::from(attachment.size),
+                    None,
+                )
+                .await
+                {
+                    Ok(block) => {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        extra_blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if media::is_video_file(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                        ) {
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                            extra_blocks.push(video_attachment_block(
+                                &attachment.filename,
+                                attachment.content_type.as_deref(),
+                                u64::from(attachment.size),
+                                &attachment.url,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image attachment failed"
+                        );
+                    }
+                }
             }
         }
 
