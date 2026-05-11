@@ -440,6 +440,21 @@ pub struct ReactionTiming {
     pub done_hold_ms: u64,
     #[serde(default = "default_error_hold_ms")]
     pub error_hold_ms: u64,
+    /// When set, post a text "heartbeat" reply into the thread after this many
+    /// milliseconds of no ACP events. `None` (default) disables the feature,
+    /// preserving today's emoji-only stall behavior (AGENTS.md rule #1).
+    #[serde(default)]
+    pub stall_text_ms: Option<u64>,
+    /// Template rendered as the heartbeat content. Supports the `{elapsed}`
+    /// placeholder (e.g. `"11m"`). When `None`, falls back to a built-in default.
+    #[serde(default)]
+    pub stall_text_template: Option<String>,
+    /// When `true`, keep firing the heartbeat every `stall_text_ms` while the
+    /// turn is still stalled. When `false` (default), fire at most once per
+    /// stall window — the next fire only happens after an ACP event resets
+    /// the timer and the gap re-opens.
+    #[serde(default)]
+    pub stall_text_repeat: bool,
 }
 
 // --- defaults ---
@@ -546,6 +561,9 @@ impl Default for ReactionTiming {
             stall_hard_ms: default_stall_hard_ms(),
             done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
+            stall_text_ms: None,
+            stall_text_template: None,
+            stall_text_repeat: false,
         }
     }
 }

@@ -638,6 +638,7 @@ async fn dispatch_batch(
         reactions_config.enabled,
         adapter.clone(),
         trigger_msg,
+        thread_channel.clone(),
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));

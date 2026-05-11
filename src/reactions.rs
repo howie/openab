@@ -1,8 +1,12 @@
-use crate::adapter::{ChatAdapter, MessageRef};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
 use crate::config::{ReactionEmojis, ReactionTiming};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
+
+/// Fallback content for `ReactionTiming.stall_text_template` when unset.
+/// `{elapsed}` is substituted at fire time (e.g. `"11m"`).
+const DEFAULT_HEARTBEAT_TEMPLATE: &str = "⏳ still working · elapsed {elapsed}";
 
 const CODING_TOKENS: &[&str] = &["exec", "process", "read", "write", "edit", "bash", "shell"];
 const WEB_TOKENS: &[&str] = &[
@@ -27,6 +31,8 @@ fn classify_tool<'a>(name: &str, emojis: &'a ReactionEmojis) -> &'a str {
 struct Inner {
     adapter: Arc<dyn ChatAdapter>,
     message: MessageRef,
+    thread_channel: ChannelRef,
+    turn_start: Instant,
     emojis: ReactionEmojis,
     timing: ReactionTiming,
     current: String,
@@ -34,6 +40,7 @@ struct Inner {
     debounce_handle: Option<tokio::task::JoinHandle<()>>,
     stall_soft_handle: Option<tokio::task::JoinHandle<()>>,
     stall_hard_handle: Option<tokio::task::JoinHandle<()>>,
+    stall_text_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct StatusReactionController {
@@ -46,6 +53,7 @@ impl StatusReactionController {
         enabled: bool,
         adapter: Arc<dyn ChatAdapter>,
         message: MessageRef,
+        thread_channel: ChannelRef,
         emojis: ReactionEmojis,
         timing: ReactionTiming,
     ) -> Self {
@@ -53,6 +61,8 @@ impl StatusReactionController {
             inner: Arc::new(Mutex::new(Inner {
                 adapter,
                 message,
+                thread_channel,
+                turn_start: Instant::now(),
                 emojis,
                 timing,
                 current: String::new(),
@@ -60,6 +70,7 @@ impl StatusReactionController {
                 debounce_handle: None,
                 stall_soft_handle: None,
                 stall_hard_handle: None,
+                stall_text_handle: None,
             })),
             enabled,
         }
@@ -213,9 +224,19 @@ impl StatusReactionController {
         if let Some(h) = inner.stall_hard_handle.take() {
             h.abort();
         }
+        if let Some(h) = inner.stall_text_handle.take() {
+            h.abort();
+        }
 
         let soft_ms = inner.timing.stall_soft_ms;
         let hard_ms = inner.timing.stall_hard_ms;
+        let text_ms_opt = inner.timing.stall_text_ms;
+        let text_repeat = inner.timing.stall_text_repeat;
+        let text_template = inner
+            .timing
+            .stall_text_template
+            .clone()
+            .unwrap_or_else(|| DEFAULT_HEARTBEAT_TEMPLATE.to_string());
         let ctrl = self.inner.clone();
 
         inner.stall_soft_handle = Some(tokio::spawn({
@@ -238,22 +259,63 @@ impl StatusReactionController {
             }
         }));
 
-        inner.stall_hard_handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(hard_ms)).await;
-            let mut inner = ctrl.lock().await;
-            if inner.finished {
-                return;
-            }
-            let old = inner.current.clone();
-            inner.current = "😨".to_string();
-            let adapter = inner.adapter.clone();
-            let msg = inner.message.clone();
-            drop(inner);
-            let _ = adapter.add_reaction(&msg, "😨").await;
-            if !old.is_empty() && old != "😨" {
-                let _ = adapter.remove_reaction(&msg, &old).await;
+        inner.stall_hard_handle = Some(tokio::spawn({
+            let ctrl = ctrl.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(hard_ms)).await;
+                let mut inner = ctrl.lock().await;
+                if inner.finished {
+                    return;
+                }
+                let old = inner.current.clone();
+                inner.current = "😨".to_string();
+                let adapter = inner.adapter.clone();
+                let msg = inner.message.clone();
+                drop(inner);
+                let _ = adapter.add_reaction(&msg, "😨").await;
+                if !old.is_empty() && old != "😨" {
+                    let _ = adapter.remove_reaction(&msg, &old).await;
+                }
             }
         }));
+
+        if let Some(text_ms) = text_ms_opt {
+            inner.stall_text_handle = Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(text_ms)).await;
+                    let (adapter, channel, content) = {
+                        let inner = ctrl.lock().await;
+                        if inner.finished {
+                            return;
+                        }
+                        let elapsed = format_elapsed(inner.turn_start.elapsed());
+                        let rendered = text_template.replace("{elapsed}", &elapsed);
+                        (
+                            inner.adapter.clone(),
+                            inner.thread_channel.clone(),
+                            rendered,
+                        )
+                    };
+                    let _ = adapter.send_message(&channel, &content).await;
+                    if !text_repeat {
+                        return;
+                    }
+                }
+            }));
+        }
+    }
+}
+
+/// Format a `Duration` as a compact human-readable elapsed string used in
+/// heartbeat templates. Examples: `"45s"`, `"11m"`, `"1h12m"`.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -271,6 +333,9 @@ fn cancel_timers(inner: &mut Inner) {
         h.abort();
     }
     if let Some(h) = inner.stall_hard_handle.take() {
+        h.abort();
+    }
+    if let Some(h) = inner.stall_text_handle.take() {
         h.abort();
     }
 }

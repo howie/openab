@@ -381,6 +381,7 @@ impl AdapterRouter {
             self.reactions_config.enabled,
             adapter.clone(),
             ctx.trigger_msg.clone(),
+            ctx.thread_channel.clone(),
             self.reactions_config.emojis.clone(),
             self.reactions_config.timing.clone(),
         ));
