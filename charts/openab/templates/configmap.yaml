@@ -168,6 +168,34 @@ data:
     {{- end }}
     tool_display = {{ ($cfg.reactions).toolDisplay | toJson }}
     {{- end }}
+    {{- with ($cfg.reactions).timing }}
+
+    [reactions.timing]
+    {{- if hasKey . "debounceMs" }}
+    debounce_ms = {{ .debounceMs }}
+    {{- end }}
+    {{- if hasKey . "stallSoftMs" }}
+    stall_soft_ms = {{ .stallSoftMs }}
+    {{- end }}
+    {{- if hasKey . "stallHardMs" }}
+    stall_hard_ms = {{ .stallHardMs }}
+    {{- end }}
+    {{- if hasKey . "doneHoldMs" }}
+    done_hold_ms = {{ .doneHoldMs }}
+    {{- end }}
+    {{- if hasKey . "errorHoldMs" }}
+    error_hold_ms = {{ .errorHoldMs }}
+    {{- end }}
+    {{- if hasKey . "stallTextMs" }}
+    stall_text_ms = {{ .stallTextMs }}
+    {{- end }}
+    {{- if hasKey . "stallTextTemplate" }}
+    stall_text_template = {{ .stallTextTemplate | toJson }}
+    {{- end }}
+    {{- if hasKey . "stallTextRepeat" }}
+    stall_text_repeat = {{ .stallTextRepeat }}
+    {{- end }}
+    {{- end }}
     {{- if ($cfg.stt).enabled }}
     {{- if not ($cfg.stt).apiKey }}
     {{ fail (printf "agents.%s.stt.apiKey is required when stt.enabled=true" $name) }}
