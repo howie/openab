@@ -5,12 +5,16 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub discord: DiscordConfig,
+    /// Discord gateway config. Optional — omit to run in HTTP-only mode.
+    pub discord: Option<DiscordConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    /// HTTP trigger server. Disabled by default.
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,12 +87,34 @@ pub struct ReactionTiming {
     pub error_hold_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpConfig {
+    /// Enable HTTP trigger server (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port to listen on (default: 7865).
+    #[serde(default = "default_http_port")]
+    pub port: u16,
+    /// Bind address (default: "127.0.0.1").
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+    /// Bearer token for authentication. Empty string disables auth (not recommended).
+    #[serde(default)]
+    pub token: String,
+    /// Default prompt timeout in milliseconds (default: 300000 = 5 min).
+    #[serde(default = "default_http_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
 // --- defaults ---
 
 fn default_working_dir() -> String { "/tmp".into() }
 fn default_max_sessions() -> usize { 10 }
 fn default_ttl_hours() -> u64 { 24 }
 fn default_true() -> bool { true }
+fn default_http_port() -> u16 { 7865 }
+fn default_http_bind() -> String { "127.0.0.1".into() }
+fn default_http_timeout_ms() -> u64 { 300_000 }
 
 fn emoji_queued() -> String { "👀".into() }
 fn emoji_thinking() -> String { "🤔".into() }
@@ -107,6 +133,18 @@ fn default_error_hold_ms() -> u64 { 2_500 }
 impl Default for PoolConfig {
     fn default() -> Self {
         Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+    }
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_http_port(),
+            bind: default_http_bind(),
+            token: String::new(),
+            timeout_ms: default_http_timeout_ms(),
+        }
     }
 }
 
