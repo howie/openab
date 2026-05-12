@@ -32,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cfg.http.enabled && cfg.http.token.is_empty() {
-        tracing::warn!("http trigger running without authentication -- set http.token in config");
+        anyhow::bail!(
+            "http trigger is enabled without a token -- set http.token in config. \
+             If running without auth is intentional (e.g. local development), \
+             set http.token = \"none\" and handle access control at the network layer."
+        );
     }
 
     info!(
