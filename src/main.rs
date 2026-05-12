@@ -28,7 +28,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::load_config(&config_path)?;
 
     if cfg.discord.is_none() && !cfg.http.enabled {
-        anyhow::bail!("no trigger configured — set [discord] bot_token or [http] enabled = true");
+        anyhow::bail!("no trigger configured -- set [discord] bot_token or [http] enabled = true");
+    }
+
+    if cfg.http.enabled && cfg.http.token.is_empty() {
+        tracing::warn!("http trigger running without authentication -- set http.token in config");
     }
 
     info!(
@@ -51,28 +55,31 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Graceful shutdown channel
+    // Graceful shutdown channel; cloned for both Ctrl+C and HTTP error path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let http_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("shutdown signal received");
         let _ = shutdown_tx.send(true);
     });
 
-    // Spawn HTTP trigger if enabled
+    // Spawn HTTP trigger if enabled; signal shutdown if server exits unexpectedly.
     let http_handle = if cfg.http.enabled {
         let pool = pool.clone();
         let http_cfg = cfg.http.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = http::run_server(pool, http_cfg).await {
                 tracing::error!("http server error: {e}");
+                let _ = http_shutdown_tx.send(true);
             }
         }))
     } else {
+        drop(http_shutdown_tx);
         None
     };
 
-    // Start Discord bot or wait for shutdown signal
+    // Start Discord bot or wait for shutdown signal.
     if let Some(discord_cfg) = cfg.discord {
         let allowed_channels: HashSet<u64> = discord_cfg
             .allowed_channels
@@ -104,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         info!("starting discord bot");
         client.start().await?;
     } else {
-        // HTTP-only mode: block until SIGINT
+        // HTTP-only mode: block until SIGINT or HTTP server exits with error.
         let mut sr = shutdown_rx;
         sr.changed().await.ok();
     }
@@ -112,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
     cleanup_handle.abort();
     if let Some(h) = http_handle {
         h.abort();
+        // Await cancellation so the task releases pool write locks before shutdown.
+        match h.await {
+            Ok(()) | Err(_) => {}
+        }
     }
     pool.shutdown().await;
     info!("openab shut down");
