@@ -12,6 +12,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"] }
 axum = "0.8"
+subtle = "2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"

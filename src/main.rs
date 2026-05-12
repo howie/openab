@@ -53,14 +53,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Graceful shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    {
-        let shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("shutdown signal received");
-            let _ = shutdown_tx.send(true);
-        });
-    }
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
+    });
 
     // Spawn HTTP trigger if enabled
     let http_handle = if cfg.http.enabled {
@@ -108,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         client.start().await?;
     } else {
         // HTTP-only mode: block until SIGINT
-        let mut sr = shutdown_rx.clone();
+        let mut sr = shutdown_rx;
         sr.changed().await.ok();
     }
 

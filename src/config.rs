@@ -5,14 +5,12 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Discord gateway config. Optional — omit to run in HTTP-only mode.
     pub discord: Option<DiscordConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
-    /// HTTP trigger server. Disabled by default.
     #[serde(default)]
     pub http: HttpConfig,
 }
@@ -89,19 +87,15 @@ pub struct ReactionTiming {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpConfig {
-    /// Enable HTTP trigger server (default: false).
     #[serde(default)]
     pub enabled: bool,
-    /// TCP port to listen on (default: 7865).
     #[serde(default = "default_http_port")]
     pub port: u16,
-    /// Bind address (default: "127.0.0.1").
     #[serde(default = "default_http_bind")]
     pub bind: String,
-    /// Bearer token for authentication. Empty string disables auth (not recommended).
+    /// Empty string disables auth (not recommended for production).
     #[serde(default)]
     pub token: String,
-    /// Default prompt timeout in milliseconds (default: 300000 = 5 min).
     #[serde(default = "default_http_timeout_ms")]
     pub timeout_ms: u64,
 }

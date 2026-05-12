@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tracing::info;
 
 #[derive(Clone)]
@@ -41,7 +42,8 @@ async fn handle_prompt(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
-        if provided != state.token {
+        let ok: bool = provided.as_bytes().ct_eq(state.token.as_bytes()).into();
+        if !ok {
             return Err((StatusCode::UNAUTHORIZED, "invalid token".into()));
         }
     }
