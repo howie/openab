@@ -81,6 +81,35 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_http_port")]
+    pub port: u16,
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+    /// Empty string disables auth (not recommended for production).
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_http_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_http_port(),
+            bind: default_http_bind(),
+            token: String::new(),
+            timeout_ms: default_http_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -499,6 +528,16 @@ fn default_done_hold_ms() -> u64 {
 }
 fn default_error_hold_ms() -> u64 {
     2_500
+}
+
+fn default_http_port() -> u16 {
+    7865
+}
+fn default_http_bind() -> String {
+    "127.0.0.1".into()
+}
+fn default_http_timeout_ms() -> u64 {
+    300_000
 }
 
 impl Default for PoolConfig {

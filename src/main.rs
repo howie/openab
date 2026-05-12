@@ -8,6 +8,7 @@ mod dispatch;
 mod error_display;
 mod format;
 mod gateway;
+mod http;
 mod markdown;
 mod media;
 mod reactions;
@@ -119,9 +120,17 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() && !cfg.http.enabled {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], and/or [gateway] to config.toml"
+            "no adapter configured — add [discord], [slack], [gateway], or [http] to config.toml"
+        );
+    }
+
+    if cfg.http.enabled && cfg.http.token.is_empty() {
+        anyhow::bail!(
+            "http trigger is enabled without a token -- set http.token in config. \
+             If running without auth is intentional (e.g. local development), \
+             set http.token = \"none\" and handle access control at the network layer."
         );
     }
 
@@ -313,6 +322,22 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn HTTP trigger if enabled; signal shutdown if server exits unexpectedly.
+    let http_handle = if cfg.http.enabled {
+        let pool = pool.clone();
+        let http_cfg = cfg.http.clone();
+        let http_shutdown_tx = shutdown_tx.clone();
+        info!(port = http_cfg.port, bind = %http_cfg.bind, "starting http trigger");
+        Some(tokio::spawn(async move {
+            if let Err(e) = http::run_server(pool, http_cfg).await {
+                tracing::error!("http server error: {e}");
+                let _ = http_shutdown_tx.send(true);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Spawn cron scheduler (background task) — reuses shared adapters
     let usercron_path = if cfg.cron.usercron_enabled {
         cfg.cron.usercron_path.as_ref().map(|p| {
@@ -484,6 +509,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Cleanup
     cleanup_handle.abort();
+    if let Some(h) = http_handle {
+        h.abort();
+        match h.await {
+            Ok(()) | Err(_) => {}
+        }
+    }
     // Signal Slack adapter to shut down gracefully
     let _ = shutdown_tx.send(true);
     if let Some(handle) = slack_handle {
