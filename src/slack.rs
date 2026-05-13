@@ -1062,6 +1062,10 @@ async fn handle_message(
                         );
                         failed_image_files.push(filename.to_string());
                     }
+                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                        warn!(filename, error = %e, "image post-processing failed");
+                        failed_image_files.push(filename.to_string());
+                    }
                     Err(e) => {
                         warn!(filename, error = %e, "image download failed");
                     }
@@ -1079,13 +1083,9 @@ async fn handle_message(
             parent_id: None,
             origin_event_id: None,
         };
-        // Sanitize filenames before embedding in mrkdwn: backticks and angle-
-        // bracket sequences (`<@U...>`, `<!here>`) are Slack markup delimiters
-        // that would allow injection if the filename is user-controlled.
-        let sanitize = |s: &str| s.replace('`', "'").replace('<', "(").replace('>', ")");
         let file_list = failed_image_files
             .iter()
-            .map(|n| sanitize(n))
+            .map(|n| sanitize_slack_filename(n))
             .collect::<Vec<_>>()
             .join("`, `");
         let msg = format!(
@@ -1222,6 +1222,15 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
 /// `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
     media::strip_mime_params(mimetype)
+}
+
+/// Sanitize a filename for safe embedding in a Slack mrkdwn message.
+///
+/// Backticks (`) and angle brackets (`<`, `>`) are Slack markup delimiters.
+/// Without sanitization, a user-controlled filename such as `<!here>` or
+/// `` `<@U123>` `` would be rendered as a Slack mention or @-here ping.
+pub(crate) fn sanitize_slack_filename(s: &str) -> String {
+    s.replace('`', "'").replace('<', "(").replace('>', ")")
 }
 
 /// True only when a Slack non-bot event represents a real user message
@@ -1389,6 +1398,35 @@ mod tests {
             "permalink": "https://docs.google.com/...",
         });
         assert_eq!(slack_file_download_url(&file), "");
+    }
+
+    // --- sanitize_slack_filename tests ---
+
+    #[test]
+    fn sanitize_leaves_normal_filename_unchanged() {
+        assert_eq!(sanitize_slack_filename("photo.png"), "photo.png");
+        assert_eq!(sanitize_slack_filename("my file (1).jpg"), "my file (1).jpg");
+    }
+
+    #[test]
+    fn sanitize_replaces_backtick() {
+        assert_eq!(sanitize_slack_filename("file`name.png"), "file'name.png");
+    }
+
+    #[test]
+    fn sanitize_replaces_angle_brackets() {
+        // Angle brackets are Slack mrkdwn delimiters; they must not pass through.
+        assert_eq!(sanitize_slack_filename("<@U123>"), "(@U123)");
+        assert_eq!(sanitize_slack_filename("<!here>"), "(!here)");
+    }
+
+    #[test]
+    fn sanitize_combined_injection_attempt() {
+        // A filename constructed to inject a Slack @here ping.
+        assert_eq!(
+            sanitize_slack_filename("`<!here>`"),
+            "'(!here)'"
+        );
     }
 
     // --- strip_mime_params tests ---

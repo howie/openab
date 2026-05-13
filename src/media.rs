@@ -38,6 +38,9 @@ pub enum MediaFetchError {
     /// Server returned a non-success HTTP status.
     HttpStatus(reqwest::StatusCode),
     /// Body was a valid image but post-processing (resize/compress) failed.
+    /// Unlike `InvalidImageBody`, the bytes decoded successfully — this is an
+    /// unexpected processing error, not a content validation failure. Callers
+    /// should surface the same user-facing warning as `InvalidImageBody`.
     ProcessingFailed(image::ImageError),
 }
 
@@ -84,10 +87,15 @@ fn hex_prefix(body: &[u8]) -> String {
 /// Slack's auth redirect when `files:read` scope is missing), rejects immediately.
 /// Generic types such as `application/octet-stream` and absent headers pass through
 /// to the magic-byte check, which is the authoritative gate for image validity.
+///
+/// Content-Type is filtered with a block-list (`text/*`) rather than an allow-list
+/// (`image/*`) because CDNs commonly serve any file type as `application/octet-stream`;
+/// rejecting that header would silently break real downloads. The magic-byte check
+/// examines the actual bytes regardless of what the server claims.
 fn validate_image_response(
     content_type: Option<&str>,
     body: &[u8],
-) -> Result<image::ImageFormat, MediaFetchError> {
+) -> Result<(), MediaFetchError> {
     // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
     // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
@@ -108,14 +116,17 @@ fn validate_image_response(
     };
 
     match reader.format() {
-        Some(
-            fmt @ (image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP),
-        ) => Ok(fmt),
+        Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP) => {
+            Ok(())
+        }
         Some(image::ImageFormat::Gif) => {
-            validate_gif_body(body).map_err(|_| MediaFetchError::InvalidImageBody {
-                magic_prefix_hex: hex_prefix(body),
+            validate_gif_body(body).map_err(|e| {
+                debug!(error = %e, "GIF validation failed");
+                MediaFetchError::InvalidImageBody {
+                    magic_prefix_hex: hex_prefix(body),
+                }
             })?;
-            Ok(image::ImageFormat::Gif)
+            Ok(())
         }
         _ => Err(MediaFetchError::InvalidImageBody {
             magic_prefix_hex: hex_prefix(body),
@@ -123,6 +134,15 @@ fn validate_image_response(
     }
 }
 
+/// Validate a GIF body by attempting to decode exactly one frame.
+///
+/// Decoding only the first frame is intentional: the GIF header and colour tables
+/// must be valid before the first frame can be decoded, so this catches truncated
+/// or corrupt payloads without the CPU/memory cost of decoding a large animated GIF
+/// in full.
+///
+/// Creates its own `Cursor` over `raw`; the caller can independently re-read the
+/// same slice for resizing.
 fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
     let decoder = GifDecoder::new(Cursor::new(raw))?;
     let mut frames = decoder.into_frames();
@@ -142,7 +162,9 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
 /// `Err(MediaFetchError::SizeExceeded)` when the declared `size` exceeds the limit
 /// before any request is made.  Returns other `Err` variants (`Network`,
 /// `HttpStatus`, `UnsupportedResponseType`, `InvalidImageBody`) after a request
-/// attempt — callers should surface these to the user.
+/// attempt — callers should surface these to the user.  Returns
+/// `Err(MediaFetchError::ProcessingFailed)` when the body is a valid image but
+/// resize/compression fails — callers should warn the user and skip.
 ///
 /// Pass `auth_token` for platforms that require authentication (e.g. Slack private files).
 pub async fn download_and_encode_image(
@@ -657,6 +679,17 @@ mod tests {
         // Even if the body were a valid image, a text/html Content-Type must be rejected.
         let png = make_png(1, 1);
         let result = validate_image_response(Some("text/html; charset=utf-8"), &png);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::UnsupportedResponseType { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_mixed_case_text_content_type() {
+        // Mixed-case Content-Type must be normalised before rejection.
+        let png = make_png(1, 1);
+        let result = validate_image_response(Some("Text/HTML; Charset=utf-8"), &png);
         assert!(matches!(
             result,
             Err(MediaFetchError::UnsupportedResponseType { .. })
