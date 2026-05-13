@@ -2,7 +2,8 @@ use crate::acp::ContentBlock;
 use crate::config::SttConfig;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use image::ImageReader;
+use image::codecs::gif::GifDecoder;
+use image::{AnimationDecoder, ImageReader};
 use std::io::Cursor;
 use std::sync::LazyLock;
 use tracing::{debug, error};
@@ -89,9 +90,7 @@ fn validate_image_response(
     if let Some(ct) = content_type {
         let base = strip_mime_params(ct).to_lowercase();
         if base.starts_with("text/") {
-            return Err(MediaFetchError::UnsupportedResponseType {
-                actual: Some(base),
-            });
+            return Err(MediaFetchError::UnsupportedResponseType { actual: Some(base) });
         }
     }
 
@@ -107,15 +106,25 @@ fn validate_image_response(
 
     match reader.format() {
         Some(
-            fmt @ (image::ImageFormat::Png
-                | image::ImageFormat::Jpeg
-                | image::ImageFormat::Gif
-                | image::ImageFormat::WebP),
+            fmt @ (image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP),
         ) => Ok(fmt),
+        Some(image::ImageFormat::Gif) => {
+            validate_gif_body(body).map_err(|_| MediaFetchError::InvalidImageBody {
+                magic_prefix_hex: hex_prefix(body),
+            })?;
+            Ok(image::ImageFormat::Gif)
+        }
         _ => Err(MediaFetchError::InvalidImageBody {
             magic_prefix_hex: hex_prefix(body),
         }),
     }
+}
+
+fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
+    GifDecoder::new(Cursor::new(raw))?
+        .into_frames()
+        .collect_frames()?;
+    Ok(())
 }
 
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
@@ -205,7 +214,11 @@ pub async fn download_and_encode_image(
     };
 
     if bytes.len() as u64 > MAX_SIZE {
-        error!(filename, size = bytes.len(), "downloaded image exceeds limit");
+        error!(
+            filename,
+            size = bytes.len(),
+            "downloaded image exceeds limit"
+        );
         return Err(MediaFetchError::SizeExceeded {
             actual: bytes.len() as u64,
             limit: MAX_SIZE,
@@ -304,6 +317,7 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
     let format = reader.format();
 
     if format == Some(image::ImageFormat::Gif) {
+        validate_gif_body(raw)?;
         return Ok((raw.to_vec(), "image/gif".to_string()));
     }
 
@@ -489,6 +503,14 @@ mod tests {
         buf.into_inner()
     }
 
+    fn make_gif() -> Vec<u8> {
+        vec![
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+        ]
+    }
+
     #[test]
     fn large_image_resized_to_max_dimension() {
         let png = make_png(3000, 2000);
@@ -546,11 +568,7 @@ mod tests {
 
     #[test]
     fn gif_passes_through_unchanged() {
-        let gif: Vec<u8> = vec![
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
-            0x3B,
-        ];
+        let gif = make_gif();
         let (output, mime) = resize_and_compress(&gif).unwrap();
 
         assert_eq!(mime, "image/gif");
@@ -587,12 +605,18 @@ mod tests {
 
     #[test]
     fn validate_accepts_gif_with_matching_content_type() {
-        let gif: Vec<u8> = vec![
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
-            0x3B,
-        ];
+        let gif = make_gif();
         assert!(validate_image_response(Some("image/gif"), &gif).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_corrupt_gif_body() {
+        let corrupt_gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00";
+        let result = validate_image_response(Some("image/gif"), corrupt_gif);
+        assert!(matches!(
+            result,
+            Err(MediaFetchError::InvalidImageBody { .. })
+        ));
     }
 
     #[test]
