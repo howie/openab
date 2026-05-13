@@ -403,7 +403,8 @@ async fn main() -> anyhow::Result<()> {
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids = parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -474,8 +475,16 @@ async fn main() -> anyhow::Result<()> {
 
         // Graceful Discord shutdown on ctrl_c
         let shard_manager = client.shard_manager.clone();
+        let mut discord_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
+            tokio::select! {
+                _ = shutdown_signal() => {}
+                changed = discord_shutdown_rx.changed() => {
+                    if changed.is_ok() {
+                        info!("shutdown requested");
+                    }
+                }
+            }
             info!("shutdown signal received");
             shard_manager.shutdown_all().await;
         });
@@ -501,9 +510,17 @@ async fn main() -> anyhow::Result<()> {
             Ok(_) => {}
         }
     } else {
-        // No Discord — wait for SIGINT or SIGTERM
+        // No Discord — wait for SIGINT/SIGTERM or another adapter requesting shutdown.
         info!("running without discord, press ctrl+c to stop");
-        shutdown_signal().await;
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::select! {
+            _ = shutdown_signal() => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() {
+                    info!("shutdown requested");
+                }
+            }
+        }
         info!("shutdown signal received");
     }
 

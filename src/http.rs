@@ -60,7 +60,10 @@ async fn handle_prompt(
     }
 
     if req.session_id.is_empty() || req.prompt.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "session_id and prompt are required".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "session_id and prompt are required".into(),
+        ));
     }
     if req.session_id.len() > MAX_SESSION_ID {
         return Err((StatusCode::BAD_REQUEST, "session_id too long".into()));
@@ -72,27 +75,29 @@ async fn handle_prompt(
     // Namespace HTTP sessions so they cannot collide with Discord thread IDs.
     let pool_key = format!("http:{}", req.session_id);
 
-    state
-        .pool
-        .get_or_create(&pool_key)
-        .await
-        .map_err(|e| {
-            tracing::warn!(session_id = %req.session_id, err = %e, "pool unavailable");
-            (StatusCode::SERVICE_UNAVAILABLE, "service unavailable".into())
-        })?;
+    state.pool.get_or_create(&pool_key).await.map_err(|e| {
+        tracing::warn!(session_id = %req.session_id, err = %e, "pool unavailable");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable".into(),
+        )
+    })?;
 
     let timeout = std::time::Duration::from_millis(state.timeout_ms);
-    tokio::time::timeout(
-        timeout,
-        run_prompt(&state.pool, &pool_key, &req.prompt),
-    )
-    .await
-    .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "prompt timeout".into()))?
-    .map(Json)
-    .map_err(|e| {
-        tracing::error!(session_id = %req.session_id, err = %e, "prompt failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-    })
+    match tokio::time::timeout(timeout, run_prompt(&state.pool, &pool_key, &req.prompt)).await {
+        Ok(Ok(resp)) => Ok(Json(resp)),
+        Ok(Err(e)) => {
+            tracing::error!(session_id = %req.session_id, err = %e, "prompt failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()))
+        }
+        Err(_) => {
+            tracing::warn!(session_id = %req.session_id, "prompt timeout; resetting http session");
+            if let Err(e) = state.pool.reset_session(&pool_key).await {
+                tracing::warn!(session_id = %req.session_id, err = %e, "failed to reset timed-out http session");
+            }
+            Err((StatusCode::GATEWAY_TIMEOUT, "prompt timeout".into()))
+        }
+    }
 }
 
 async fn run_prompt(
@@ -106,8 +111,10 @@ async fn run_prompt(
             let reset = conn.session_reset;
             conn.session_reset = false;
 
-            let blocks = vec![ContentBlock::Text { text: prompt.clone() }];
-            let (mut rx, _) = match conn.session_prompt(blocks).await {
+            let blocks = vec![ContentBlock::Text {
+                text: prompt.clone(),
+            }];
+            let (mut rx, request_id) = match conn.session_prompt(blocks).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Always clear the subscriber slot even on failure.
@@ -118,7 +125,13 @@ async fn run_prompt(
 
             let mut text_buf = String::new();
             while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
+                if let Some(notification_id) = notification.id {
+                    if notification_id != request_id {
+                        continue;
+                    }
+                    if let Some(err) = notification.error {
+                        return Err(anyhow::anyhow!("agent returned {err}"));
+                    }
                     break;
                 }
                 if let Some(AcpEvent::Text(t)) = classify_notification(&notification) {
@@ -148,7 +161,8 @@ pub async fn run_server(pool: Arc<SessionPool>, cfg: HttpConfig) -> anyhow::Resu
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     info!(addr = %addr, "http trigger server starting");
-    let listener = tokio::net::TcpListener::bind(&addr).await
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
     axum::serve(listener, app).await?;
     Ok(())
