@@ -37,6 +37,8 @@ pub enum MediaFetchError {
     Network(reqwest::Error),
     /// Server returned a non-success HTTP status.
     HttpStatus(reqwest::StatusCode),
+    /// Body was a valid image but post-processing (resize/compress) failed.
+    ProcessingFailed(image::ImageError),
 }
 
 impl std::fmt::Display for MediaFetchError {
@@ -57,6 +59,7 @@ impl std::fmt::Display for MediaFetchError {
             }
             Self::Network(e) => write!(f, "network error: {e}"),
             Self::HttpStatus(s) => write!(f, "HTTP {s}"),
+            Self::ProcessingFailed(e) => write!(f, "image processing failed: {e}"),
         }
     }
 }
@@ -121,9 +124,14 @@ fn validate_image_response(
 }
 
 fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
-    GifDecoder::new(Cursor::new(raw))?
-        .into_frames()
-        .collect_frames()?;
+    let decoder = GifDecoder::new(Cursor::new(raw))?;
+    let mut frames = decoder.into_frames();
+    frames.next().ok_or_else(|| {
+        image::ImageError::Decoding(image::error::DecodingError::new(
+            image::error::ImageFormatHint::Exact(image::ImageFormat::Gif),
+            "GIF has no frames",
+        ))
+    })??;
     Ok(())
 }
 
@@ -242,17 +250,13 @@ pub async fn download_and_encode_image(
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
-            let magic = hex_prefix(&bytes);
             error!(
                 filename,
                 error = %e,
-                magic = %magic,
                 size = bytes.len(),
                 "resize failed after successful validation"
             );
-            return Err(MediaFetchError::InvalidImageBody {
-                magic_prefix_hex: magic,
-            });
+            return Err(MediaFetchError::ProcessingFailed(e));
         }
     };
 
@@ -317,7 +321,6 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
     let format = reader.format();
 
     if format == Some(image::ImageFormat::Gif) {
-        validate_gif_body(raw)?;
         return Ok((raw.to_vec(), "image/gif".to_string()));
     }
 
@@ -732,6 +735,13 @@ mod tests {
         }
         .to_string();
         let _ = MediaFetchError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED).to_string();
+        let _ = MediaFetchError::ProcessingFailed(image::ImageError::Unsupported(
+            image::error::UnsupportedError::from_format_and_kind(
+                image::error::ImageFormatHint::Unknown,
+                image::error::UnsupportedErrorKind::Color(image::ExtendedColorType::Rgba16),
+            ),
+        ))
+        .to_string();
     }
 
     #[test]
