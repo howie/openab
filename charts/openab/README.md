@@ -30,6 +30,11 @@ Each agent lives under `agents.<name>`.
 | `slack.appToken` | Slack App-Level token for Socket Mode. | `""` |
 | `slack.allowedChannels` | Slack channel allowlist. Empty means allow all channels by default. | `[]` |
 | `slack.allowedUsers` | Slack user allowlist. Empty means allow all users by default. | `[]` |
+| `http.enabled` | Enable `POST /prompt` HTTP trigger for this agent. | `false` |
+| `http.bind` | HTTP listen address. Defaults to loopback for pod-local access. | `"127.0.0.1"` |
+| `http.port` | HTTP listen port. | `7865` |
+| `http.token` | Bearer token for `POST /prompt`; required when HTTP is enabled. | `""` |
+| `http.timeoutMs` | Prompt timeout in milliseconds. | `300000` |
 | `nameOverride` | Override this agent's generated resource name. | `""` |
 | `workingDir` | Working directory and HOME inside the container. | `"/home/agent"` |
 | `env` | Inline environment variables passed to the agent process. | `{}` |
@@ -81,6 +86,17 @@ agents:
 ```
 
 This is useful for credentials such as `GH_TOKEN` without storing them directly in Helm values.
+
+### Enable the HTTP trigger
+
+```bash
+helm install openab openab/openab \
+  --set agents.kiro.discord.enabled=false \
+  --set agents.kiro.http.enabled=true \
+  --set-literal agents.kiro.http.token="$HTTP_TRIGGER_TOKEN"
+```
+
+The default HTTP bind address is `127.0.0.1`, so the endpoint is pod-local. Use a sidecar, ingress, or network policy before exposing it beyond the pod.
 
 ### Provide `AGENTS.md` with `--set-file`
 

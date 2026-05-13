@@ -1,0 +1,98 @@
+suite: http trigger config rendering
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: does not render [http] when disabled
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: '\[http\]'
+
+  - it: renders [http] when enabled with token
+    set:
+      agents.kiro.http.enabled: true
+      agents.kiro.http.token: "secret"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '\[http\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'enabled = true'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bind = "127.0.0.1"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'port = 7865'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'token = "\$\{HTTP_TRIGGER_TOKEN\}"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'timeout_ms = 300000'
+
+  - it: renders custom bind port and timeout
+    set:
+      agents.kiro.http.enabled: true
+      agents.kiro.http.bind: "0.0.0.0"
+      agents.kiro.http.port: 8080
+      agents.kiro.http.token: "secret"
+      agents.kiro.http.timeoutMs: 15000
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'bind = "0.0.0.0"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'port = 8080'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'timeout_ms = 15000'
+
+  - it: fails when enabled without token
+    set:
+      agents.kiro.http.enabled: true
+      agents.kiro.http.token: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "http.token is required when http.enabled=true"
+
+---
+suite: http trigger secret rendering
+templates:
+  - templates/secret.yaml
+tests:
+  - it: renders http token secret when enabled
+    set:
+      agents.kiro.http.enabled: true
+      agents.kiro.http.token: "secret"
+    asserts:
+      - equal:
+          path: data.http-trigger-token
+          value: "c2VjcmV0"
+
+---
+suite: http trigger deployment rendering
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: injects HTTP_TRIGGER_TOKEN and port when enabled
+    set:
+      agents.kiro.http.enabled: true
+      agents.kiro.http.token: "secret"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: HTTP_TRIGGER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-openab-kiro
+                key: http-trigger-token
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: http
+            containerPort: 7865
+            protocol: TCP

@@ -38,6 +38,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
 - **Custom Gateway** — extend to Telegram, LINE, Feishu/Lark, Google Chat, MS Teams via standalone [gateway](gateway/)
+- **HTTP trigger** — call `POST /prompt` for local automation and service-to-service prompts ([docs/http-trigger.md](docs/http-trigger.md))
 - **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups

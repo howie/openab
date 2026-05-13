@@ -320,6 +320,12 @@ agents:
         webhookPath: ""        # Gateway default: /webhook/wecom → WECOM_WEBHOOK_PATH
         streamingEnabled: ""   # Enable thinking-placeholder + recall streaming (causes brief client flicker) → WECOM_STREAMING_ENABLED. Default off.
         debounceSecs: ""       # Debounce quiet-period seconds before flushing streamed text → WECOM_DEBOUNCE_SECS. Default 3, minimum 1 (0 is treated as unset by Helm).
+    http:
+      enabled: false           # set to true to enable POST /prompt HTTP trigger
+      bind: "127.0.0.1"        # loopback by default; use 0.0.0.0 only with network controls
+      port: 7865
+      token: ""                # required when enabled; stored in Secret and injected as HTTP_TRIGGER_TOKEN
+      timeoutMs: 300000
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:

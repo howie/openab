@@ -34,31 +34,29 @@ struct PromptResponse {
     session_reset: bool,
 }
 
-async fn handle_prompt(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<PromptRequest>,
-) -> Result<Json<PromptResponse>, (StatusCode, String)> {
-    if !state.token.is_empty() {
-        // Extract Bearer token; scheme comparison is case-insensitive per RFC 7235.
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                let mut parts = v.splitn(2, ' ');
-                let scheme = parts.next()?;
-                if !scheme.eq_ignore_ascii_case("bearer") {
-                    return None;
-                }
-                parts.next()
-            })
-            .unwrap_or("");
-        let ok: bool = provided.as_bytes().ct_eq(state.token.as_bytes()).into();
-        if !ok {
-            return Err((StatusCode::UNAUTHORIZED, "invalid token".into()));
-        }
+fn bearer_authorized(headers: &HeaderMap, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
     }
 
+    // Extract Bearer token; scheme comparison is case-insensitive per RFC 7235.
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let mut parts = v.splitn(2, ' ');
+            let scheme = parts.next()?;
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return None;
+            }
+            parts.next()
+        })
+        .unwrap_or("");
+
+    provided.as_bytes().ct_eq(token.as_bytes()).into()
+}
+
+fn validate_prompt_request(req: &PromptRequest) -> Result<(), (StatusCode, String)> {
     if req.session_id.is_empty() || req.prompt.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -71,6 +69,19 @@ async fn handle_prompt(
     if req.prompt.len() > MAX_PROMPT {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, "prompt too long".into()));
     }
+    Ok(())
+}
+
+async fn handle_prompt(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PromptRequest>,
+) -> Result<Json<PromptResponse>, (StatusCode, String)> {
+    if !bearer_authorized(&headers, &state.token) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".into()));
+    }
+
+    validate_prompt_request(&req)?;
 
     // Namespace HTTP sessions so they cannot collide with Discord thread IDs.
     let pool_key = format!("http:{}", req.session_id);
@@ -166,4 +177,68 @@ pub async fn run_server(pool: Arc<SessionPool>, cfg: HttpConfig) -> anyhow::Resu
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::AUTHORIZATION;
+
+    fn prompt_request(session_id: &str, prompt: &str) -> PromptRequest {
+        PromptRequest {
+            session_id: session_id.to_string(),
+            prompt: prompt.to_string(),
+        }
+    }
+
+    #[test]
+    fn bearer_authorized_accepts_valid_token_case_insensitive_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "bEaReR secret".parse().unwrap());
+
+        assert!(bearer_authorized(&headers, "secret"));
+    }
+
+    #[test]
+    fn bearer_authorized_rejects_missing_wrong_or_wrong_scheme() {
+        assert!(!bearer_authorized(&HeaderMap::new(), "secret"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer nope".parse().unwrap());
+        assert!(!bearer_authorized(&headers, "secret"));
+
+        headers.insert(AUTHORIZATION, "Basic secret".parse().unwrap());
+        assert!(!bearer_authorized(&headers, "secret"));
+    }
+
+    #[test]
+    fn bearer_authorized_allows_empty_token_for_internal_tests_only() {
+        assert!(bearer_authorized(&HeaderMap::new(), ""));
+    }
+
+    #[test]
+    fn validate_prompt_request_accepts_valid_payload() {
+        assert!(validate_prompt_request(&prompt_request("session", "hello")).is_ok());
+    }
+
+    #[test]
+    fn validate_prompt_request_rejects_empty_fields() {
+        let err = validate_prompt_request(&prompt_request("", "hello")).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = validate_prompt_request(&prompt_request("session", "")).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_prompt_request_rejects_large_payloads() {
+        let err =
+            validate_prompt_request(&prompt_request(&"s".repeat(MAX_SESSION_ID + 1), "hello"))
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = validate_prompt_request(&prompt_request("session", &"p".repeat(MAX_PROMPT + 1)))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

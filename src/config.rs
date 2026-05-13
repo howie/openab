@@ -938,6 +938,37 @@ command = "echo"
     }
 
     #[test]
+    fn http_config_defaults_when_omitted() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(!cfg.http.enabled);
+        assert_eq!(cfg.http.bind, "127.0.0.1");
+        assert_eq!(cfg.http.port, 7865);
+        assert!(cfg.http.token.is_empty());
+        assert_eq!(cfg.http.timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn parse_http_config() {
+        let toml = r#"
+[http]
+enabled = true
+bind = "0.0.0.0"
+port = 8080
+token = "secret"
+timeout_ms = 15000
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.http.enabled);
+        assert_eq!(cfg.http.bind, "0.0.0.0");
+        assert_eq!(cfg.http.port, 8080);
+        assert_eq!(cfg.http.token, "secret");
+        assert_eq!(cfg.http.timeout_ms, 15_000);
+    }
+
+    #[test]
     fn stt_echo_transcript_defaults_to_false() {
         let cfg = SttConfig::default();
         assert!(

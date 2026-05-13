@@ -37,6 +37,12 @@ spec:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
           imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
+          {{- if ($cfg.http).enabled }}
+          ports:
+            - name: http
+              containerPort: {{ ($cfg.http).port | default 7865 | int }}
+              protocol: TCP
+          {{- end }}
           {{- with $.Values.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -76,6 +82,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "openab.agentFullname" $d }}
                   key: gateway-ws-token
+            {{- end }}
+            {{- if and ($cfg.http).enabled ($cfg.http).token }}
+            - name: HTTP_TRIGGER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: http-trigger-token
             {{- end }}
             - name: HOME
               value: {{ $cfg.workingDir | default "/home/agent" }}

@@ -2,7 +2,7 @@
 
 OpenAB is configured via a TOML file (default: `config.toml`). Environment variables can be interpolated using `${VAR_NAME}` syntax.
 
-At least one adapter section (`[discord]` or `[slack]`) is required.
+At least one adapter section (`[discord]`, `[slack]`, `[gateway]`, or `[http]` with `enabled = true`) is required.
 
 ## Loading Config
 
@@ -77,6 +77,55 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+
+---
+
+## `[http]`
+
+HTTP trigger adapter. Exposes a minimal JSON API for local automation and service-to-service prompts.
+
+```toml
+[http]
+enabled = true
+bind = "127.0.0.1"
+port = 7865
+token = "${HTTP_TRIGGER_TOKEN}"
+timeout_ms = 300000
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable `POST /prompt`. |
+| `bind` | string | `"127.0.0.1"` | Listen address. Keep loopback unless an ingress, sidecar, or network policy provides access control. |
+| `port` | u16 | `7865` | Listen port. |
+| `token` | string | `""` | Bearer token required by `Authorization: Bearer <token>`. Startup fails when HTTP is enabled and this is empty. |
+| `timeout_ms` | u64 | `300000` | Prompt timeout in milliseconds. A timeout returns HTTP 504 and resets that HTTP session. |
+
+Request:
+
+```bash
+curl -sS http://127.0.0.1:7865/prompt \
+  -H "Authorization: Bearer $HTTP_TRIGGER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"build-123","prompt":"summarize the last CI failure"}'
+```
+
+Response:
+
+```json
+{"response":"...","session_reset":false}
+```
+
+Limits:
+
+| Field | Limit |
+|-------|-------|
+| `session_id` | 1-128 bytes |
+| `prompt` | 1-65536 bytes |
+
+HTTP sessions use `http:<session_id>` internally, so they do not collide with Discord, Slack, or Gateway session keys.
+
+See [HTTP trigger guide](http-trigger.md) for deployment examples and security notes.
 
 ---
 
@@ -310,6 +359,11 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.discord.trustedBotIds` | `[discord] trusted_bot_ids` |
 | `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
+| `agents.<name>.http.enabled` | `[http] enabled` |
+| `agents.<name>.http.bind` | `[http] bind` |
+| `agents.<name>.http.port` | `[http] port` |
+| `agents.<name>.http.token` | `[http] token` via `HTTP_TRIGGER_TOKEN` Secret |
+| `agents.<name>.http.timeoutMs` | `[http] timeout_ms` |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |

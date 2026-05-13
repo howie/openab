@@ -224,6 +224,18 @@ data:
     max_batch_tokens = {{ ($cfg.gateway).maxBatchTokens | int }}
     {{- end }}
     {{- end }}
+    {{- if ($cfg.http).enabled }}
+    {{- if not ($cfg.http).token }}
+    {{ fail (printf "agents.%s.http.token is required when http.enabled=true" $name) }}
+    {{- end }}
+
+    [http]
+    enabled = true
+    bind = {{ ($cfg.http).bind | default "127.0.0.1" | toJson }}
+    port = {{ ($cfg.http).port | default 7865 | int }}
+    token = "${HTTP_TRIGGER_TOKEN}"
+    timeout_ms = {{ ($cfg.http).timeoutMs | default 300000 | int }}
+    {{- end }}
     {{- if or ($cfg.cronjobs) (($cfg.cron).usercronEnabled) (($cfg.cron).usercronPath) }}
 
     [cron]
