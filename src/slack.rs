@@ -117,6 +117,7 @@ impl SlackAdapter {
                     .ok_or_else(|| anyhow!("no user_id in auth.test response"))
             })
             .await
+            .inspect_err(|e| warn!(error = %e, "bot user ID unavailable; mention detection may suppress bot messages under Mentions mode"))
             .ok()
             .map(|s| s.as_str())
     }
@@ -307,7 +308,7 @@ impl SlackAdapter {
         let parent_mentions_bot = messages
             .first()
             .and_then(|m| m["text"].as_str())
-            .is_some_and(|text| text.contains(&format!("<@{bot_id}>")));
+            .is_some_and(|text| text_mentions_uid(text, bot_id));
 
         let bot_posted = messages.iter().any(|m| m["user"].as_str() == Some(bot_id));
 
@@ -607,7 +608,7 @@ pub async fn run_slack_adapter(
                                                 let bot_uid_opt = adapter.get_bot_user_id().await.map(|s| s.to_string());
                                                 let mentions_bot = bot_uid_opt
                                                     .as_ref()
-                                                    .is_some_and(|bot_uid| msg_text.contains(&format!("<@{bot_uid}>")));
+                                                    .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
                                                 let is_dm = channel_id.starts_with('D');
                                                 let event_user_id = event["user"].as_str();
                                                 let is_own_bot_msg = is_bot
@@ -1168,15 +1169,41 @@ async fn handle_message(
     }
 }
 
-/// Strip only the bot's own `<@BOT_UID>` trigger mention.
+/// Strip all occurrences of the bot's own `<@BOT_UID>` or `<@BOT_UID|handle>` mention.
 /// Other users' mentions stay intact so the LLM can @-mention them back.
 /// If the bot UID isn't known, fall back to returning the text trimmed —
 /// safer than stripping all mentions and losing user addressability.
 fn resolve_slack_mentions(text: &str, bot_id: Option<&str>) -> String {
-    match bot_id {
-        Some(id) => text.replace(&format!("<@{id}>"), "").trim().to_string(),
-        None => text.trim().to_string(),
+    let Some(id) = bot_id else {
+        return text.trim().to_string();
+    };
+    let prefix = format!("<@{id}");
+    let mut out = String::with_capacity(text.len());
+    let mut s = text;
+    while let Some(pos) = s.find(&prefix) {
+        let after = &s[pos + prefix.len()..];
+        match after.as_bytes().first() {
+            Some(b'>') => {
+                out.push_str(&s[..pos]);
+                s = &after[1..];
+            }
+            Some(b'|') => {
+                if let Some(close) = after.find('>') {
+                    out.push_str(&s[..pos]);
+                    s = &after[close + 1..];
+                } else {
+                    out.push_str(&s[..pos + prefix.len()]);
+                    s = after;
+                }
+            }
+            _ => {
+                out.push_str(&s[..pos + prefix.len()]);
+                s = after;
+            }
+        }
     }
+    out.push_str(s);
+    out.trim().to_string()
 }
 
 /// Pick the best download URL for a Slack file object. `url_private_download`
@@ -1194,6 +1221,18 @@ fn slack_file_download_url(file: &serde_json::Value) -> &str {
 /// `text/plain; charset=utf-8`; `media::is_text_file` expects the bare form.
 fn strip_mime_params(mimetype: &str) -> &str {
     mimetype.split(';').next().unwrap_or(mimetype).trim()
+}
+
+/// Returns `true` if `text` contains a Slack user mention for `uid`.
+///
+/// Accepts both `<@U...>` (bare) and `<@U...|handle>` (labelled) wire forms.
+/// Slack (and bots addressing peers) can emit the labelled form; `<@UID>` is
+/// not a substring of `<@UID|handle>`, so a bare `contains("<@UID>")` silently
+/// misses it.
+fn text_mentions_uid(text: &str, uid: &str) -> bool {
+    let prefix = format!("<@{uid}");
+    text.match_indices(&prefix)
+        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
 }
 
 fn bot_id_matches_trusted(
@@ -1289,6 +1328,89 @@ mod tests {
     fn resolve_mentions_unknown_bot_preserves_all() {
         let out = resolve_slack_mentions("<@U1BOT> hi <@U2ALICE>", None);
         assert_eq!(out, "<@U1BOT> hi <@U2ALICE>");
+    }
+
+    /// Labelled form of another user's mention (`<@UID|handle>`) is preserved.
+    #[test]
+    fn resolve_mentions_preserves_labelled_other_user_mention() {
+        let out = resolve_slack_mentions("<@U1BOT> say hi to <@U2ALICE|alice>", Some("U1BOT"));
+        assert_eq!(out, "say hi to <@U2ALICE|alice>");
+    }
+
+    /// Labelled form `<@UID|handle>` is stripped the same as bare form.
+    #[test]
+    fn resolve_mentions_strips_labelled_bot_mention() {
+        let out = resolve_slack_mentions("<@U1BOT|my-bot> hello", Some("U1BOT"));
+        assert_eq!(out, "hello");
+    }
+
+    /// Labelled form mid-sentence is stripped and surrounding text preserved.
+    #[test]
+    fn resolve_mentions_strips_labelled_mid_sentence() {
+        let out = resolve_slack_mentions("please ask <@U1BOT|handle> to run", Some("U1BOT"));
+        assert_eq!(out, "please ask  to run");
+    }
+
+    /// Mixed bare and labelled forms of the same UID in one string are both stripped.
+    #[test]
+    fn resolve_mentions_strips_mixed_bare_and_labelled() {
+        let out = resolve_slack_mentions("<@U1BOT> and <@U1BOT|handle> run", Some("U1BOT"));
+        assert_eq!(out, "and  run");
+    }
+
+    /// Malformed unclosed `<@UID|label` (no closing `>`) is preserved verbatim.
+    #[test]
+    fn resolve_mentions_malformed_unclosed_label_preserved() {
+        let out = resolve_slack_mentions("ask <@U1BOT|nolabel to run", Some("U1BOT"));
+        assert!(out.contains("<@U1BOT"));
+    }
+
+    #[test]
+    fn resolve_mentions_preserves_longer_uid_prefix() {
+        let out = resolve_slack_mentions("<@U1BOTX> hello", Some("U1BOT"));
+        assert_eq!(out, "<@U1BOTX> hello");
+    }
+
+    // --- text_mentions_uid tests ---
+
+    #[test]
+    fn mentions_uid_bare_form() {
+        assert!(text_mentions_uid("<@U123BOT> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_labelled_form() {
+        assert!(text_mentions_uid("<@U123BOT|my-bot> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_labelled_form_mid_sentence() {
+        assert!(text_mentions_uid("please ask <@U123BOT|handle> to run", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_no_match() {
+        assert!(!text_mentions_uid("hello world", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_no_false_positive_on_uid_prefix() {
+        assert!(!text_mentions_uid("<@U123BOT> hello", "U123"));
+    }
+
+    #[test]
+    fn mentions_uid_second_mention_matches() {
+        assert!(text_mentions_uid("<@U999OTHER> and <@U123BOT>", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_empty_label_form() {
+        assert!(text_mentions_uid("<@U123BOT|> hello", "U123BOT"));
+    }
+
+    #[test]
+    fn mentions_uid_truncated_no_closing_delimiter() {
+        assert!(!text_mentions_uid("<@U123BOT", "U123BOT"));
     }
 
     // --- is_plain_user_message tests (regression for openabdev/openab#497 parity) ---

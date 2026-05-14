@@ -257,6 +257,10 @@ impl SessionPool {
     }
 
     /// Get mutable access to a connection. Caller must have called get_or_create first.
+    ///
+    /// Only the per-connection `Mutex` is held during `f`; the pool-level
+    /// `RwLock` is acquired briefly (read-only) to look up the `Arc` and then
+    /// released, so other connections can be used concurrently.
     pub async fn with_connection<F, R>(&self, thread_id: &str, f: F) -> Result<R>
     where
         F: for<'a> FnOnce(
