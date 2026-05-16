@@ -797,6 +797,37 @@ mod tests {
     }
 
     #[test]
+    fn pack_arrival_event_keeps_text_extras_order_before_prompt() {
+        let extra = vec![
+            ContentBlock::Text {
+                text: "[Voice message transcript]: hello".into(),
+            },
+            ContentBlock::Text {
+                text: "[Attachment validation failed]: the user attempted to attach `photo.png`"
+                    .into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "abc".into(),
+            },
+        ];
+        let blocks = AdapterRouter::pack_arrival_event("{}", "typed prompt", extra);
+
+        assert_eq!(blocks.len(), 5);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text.contains("<sender_context>"))
+        );
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text { text } if text.contains("Voice message transcript"))
+        );
+        assert!(
+            matches!(&blocks[2], ContentBlock::Text { text } if text.contains("Attachment validation failed"))
+        );
+        assert!(matches!(&blocks[3], ContentBlock::Text { text } if text == "typed prompt"));
+        assert!(matches!(&blocks[4], ContentBlock::Image { .. }));
+    }
+
+    #[test]
     fn pack_arrival_event_batch_n2() {
         // Two arrival events concatenated → 2 (header + prompt) pairs = 4 blocks.
         let mut all: Vec<ContentBlock> = Vec::new();
