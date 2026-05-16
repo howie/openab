@@ -811,6 +811,10 @@ impl EventHandler for Handler {
             match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
                 Ok(ch) => ch,
                 Err(e) => {
+                    // Thread creation failed — entire message is dropped. The user
+                    // sees no reply and no warning (same as any other failed message).
+                    // The failed_image_files warning is NOT sent here because we have
+                    // no thread to target and the agent won't run anyway.
                     error!("failed to create thread: {e}");
                     return;
                 }

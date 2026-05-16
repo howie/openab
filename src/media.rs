@@ -72,7 +72,7 @@ impl std::fmt::Display for MediaFetchError {
 pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     let list = filenames
         .iter()
-        .map(|n| format!("`{n}`"))
+        .map(|n| format!("`{}`", n.replace('`', "'")))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -832,5 +832,13 @@ mod tests {
     fn format_failed_attachment_note_preserves_size_suffix() {
         let note = super::format_failed_attachment_note(&["big.png (exceeds 10000000 byte limit)".to_string()]);
         assert!(note.contains("`big.png (exceeds 10000000 byte limit)`"));
+    }
+
+    #[test]
+    fn format_failed_attachment_note_escapes_backtick_in_filename() {
+        let note = super::format_failed_attachment_note(&["fi`le.png".to_string()]);
+        // Backtick in filename is replaced with single-quote to avoid breaking the code-span.
+        assert!(note.contains("`fi'le.png`"));
+        assert!(!note.contains("``"));
     }
 }
