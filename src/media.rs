@@ -69,8 +69,7 @@ impl std::fmt::Display for MediaFetchError {
 
 /// Build a `[Attachment validation failed]` note for injection into the agent prompt
 /// so the agent's reply acknowledges the failure instead of asking "where's the image?".
-/// Caller must guarantee `filenames` is non-empty.
-pub fn format_failed_attachment_note(filenames: &[&str]) -> String {
+pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     let list = filenames
         .iter()
         .map(|n| format!("`{n}`"))
@@ -815,7 +814,7 @@ mod tests {
 
     #[test]
     fn format_failed_attachment_note_single() {
-        let note = super::format_failed_attachment_note(&["photo.png"]);
+        let note = super::format_failed_attachment_note(&["photo.png".to_string()]);
         assert!(note.contains("`photo.png`"));
         assert!(note.starts_with("[Attachment validation failed]:"));
         assert!(note.contains("The user has been notified separately"));
@@ -823,7 +822,7 @@ mod tests {
 
     #[test]
     fn format_failed_attachment_note_multiple() {
-        let note = super::format_failed_attachment_note(&["a.png", "b.jpg"]);
+        let note = super::format_failed_attachment_note(&["a.png".to_string(), "b.jpg".to_string()]);
         assert!(note.contains("`a.png`"));
         assert!(note.contains("`b.jpg`"));
         assert!(note.contains(", "));
@@ -831,7 +830,7 @@ mod tests {
 
     #[test]
     fn format_failed_attachment_note_preserves_size_suffix() {
-        let note = super::format_failed_attachment_note(&["big.png (exceeds 10000000 byte limit)"]);
+        let note = super::format_failed_attachment_note(&["big.png (exceeds 10000000 byte limit)".to_string()]);
         assert!(note.contains("`big.png (exceeds 10000000 byte limit)`"));
     }
 }

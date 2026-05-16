@@ -763,7 +763,7 @@ impl EventHandler for Handler {
                         );
                         failed_image_files.push(attachment.filename.clone());
                     }
-                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                    Err(media::MediaFetchError::ProcessingFailed(e)) => {
                         tracing::warn!(
                             url = %attachment.url,
                             filename = %attachment.filename,
@@ -792,7 +792,13 @@ impl EventHandler for Handler {
                 parent_id: None,
                 origin_event_id: None,
             };
-            let file_list = failed_image_files.join("`, `");
+            // Sanitize filenames before embedding in the user-visible message:
+            // backticks close Discord code spans and <> enable mention injection.
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| n.replace('`', "'").replace('<', "(").replace('>', ")"))
+                .collect::<Vec<_>>()
+                .join("`, `");
             let warn_msg = format!(
                 ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
                  Supported formats are PNG / JPEG / GIF / WebP up to 10 MB."
@@ -800,9 +806,8 @@ impl EventHandler for Handler {
             if let Err(e) = adapter.send_message(&warn_channel, &warn_msg).await {
                 warn!(error = %e, "failed to send image validation warning to user");
             }
-            let names: Vec<&str> = failed_image_files.iter().map(String::as_str).collect();
             extra_blocks.push(ContentBlock::Text {
-                text: media::format_failed_attachment_note(&names),
+                text: media::format_failed_attachment_note(&failed_image_files),
             });
         }
 
