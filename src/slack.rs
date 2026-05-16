@@ -1103,6 +1103,14 @@ async fn handle_message(
         if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
             warn!(error = %e, "failed to send image validation warning to user");
         }
+        // Inject a system note so the agent's reply acknowledges the failure
+        // instead of saying "I don't see any image". pack_arrival_event partitions
+        // Text blocks before the prompt (stable order), so push trails any STT
+        // transcript but precedes the typed prompt — correct position for meta-info.
+        let names: Vec<&str> = failed_image_files.iter().map(String::as_str).collect();
+        extra_blocks.push(ContentBlock::Text {
+            text: media::format_failed_attachment_note(&names),
+        });
     }
 
     // Resolve Slack display name (best-effort, fallback to user_id)

@@ -67,6 +67,23 @@ impl std::fmt::Display for MediaFetchError {
     }
 }
 
+/// Build a `[Attachment validation failed]` note for injection into the agent prompt
+/// so the agent's reply acknowledges the failure instead of asking "where's the image?".
+/// Caller must guarantee `filenames` is non-empty.
+pub fn format_failed_attachment_note(filenames: &[&str]) -> String {
+    let list = filenames
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[Attachment validation failed]: the user attempted to attach {list} but \
+         the file(s) could not be processed (unsupported format, corrupt body, or \
+         size limit exceeded). The user has been notified separately — acknowledge \
+         the failure and proceed without apologising for not seeing the file."
+    )
+}
+
 /// Strip MIME parameters and trim whitespace.  `"image/png; charset=binary"` → `"image/png"`.
 pub(crate) fn strip_mime_params(mime: &str) -> &str {
     mime.split(';').next().unwrap_or(mime).trim()
@@ -792,5 +809,29 @@ mod tests {
     fn hex_prefix_handles_short_buffer() {
         let bytes = [0xffu8, 0xd8];
         assert_eq!(hex_prefix(&bytes), "ffd8");
+    }
+
+    // --- format_failed_attachment_note tests ---
+
+    #[test]
+    fn format_failed_attachment_note_single() {
+        let note = super::format_failed_attachment_note(&["photo.png"]);
+        assert!(note.contains("`photo.png`"));
+        assert!(note.starts_with("[Attachment validation failed]:"));
+        assert!(note.contains("The user has been notified separately"));
+    }
+
+    #[test]
+    fn format_failed_attachment_note_multiple() {
+        let note = super::format_failed_attachment_note(&["a.png", "b.jpg"]);
+        assert!(note.contains("`a.png`"));
+        assert!(note.contains("`b.jpg`"));
+        assert!(note.contains(", "));
+    }
+
+    #[test]
+    fn format_failed_attachment_note_preserves_size_suffix() {
+        let note = super::format_failed_attachment_note(&["big.png (exceeds 10000000 byte limit)"]);
+        assert!(note.contains("`big.png (exceeds 10000000 byte limit)`"));
     }
 }

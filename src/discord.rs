@@ -647,6 +647,7 @@ impl EventHandler for Handler {
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
+        let mut failed_image_files: Vec<String> = Vec::new();
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
 
@@ -738,6 +739,39 @@ impl EventHandler for Handler {
                             ));
                         }
                     }
+                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            actual,
+                            limit,
+                            "image exceeds size limit"
+                        );
+                        failed_image_files.push(format!(
+                            "{} (exceeds {limit} byte limit)",
+                            attachment.filename
+                        ));
+                    }
+                    Err(
+                        media::MediaFetchError::UnsupportedResponseType { .. }
+                        | media::MediaFetchError::InvalidImageBody { .. },
+                    ) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            "image validation failed; body is not a supported image"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                    }
+                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
+                        tracing::warn!(
+                            url = %attachment.url,
+                            filename = %attachment.filename,
+                            error = %e,
+                            "image post-processing failed"
+                        );
+                        failed_image_files.push(attachment.filename.clone());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             url = %attachment.url,
@@ -748,6 +782,28 @@ impl EventHandler for Handler {
                     }
                 }
             }
+        }
+
+        if !failed_image_files.is_empty() {
+            let warn_channel = ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            };
+            let file_list = failed_image_files.join("`, `");
+            let warn_msg = format!(
+                ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
+                 Supported formats are PNG / JPEG / GIF / WebP up to 10 MB."
+            );
+            if let Err(e) = adapter.send_message(&warn_channel, &warn_msg).await {
+                warn!(error = %e, "failed to send image validation warning to user");
+            }
+            let names: Vec<&str> = failed_image_files.iter().map(String::as_str).collect();
+            extra_blocks.push(ContentBlock::Text {
+                text: media::format_failed_attachment_note(&names),
+            });
         }
 
         tracing::debug!(
