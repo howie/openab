@@ -772,6 +772,7 @@ impl EventHandler for Handler {
                         );
                         failed_image_files.push(attachment.filename.clone());
                     }
+                    // Network/HTTP failures: transient; warn in logs only, don't notify user.
                     Err(e) => {
                         tracing::warn!(
                             url = %attachment.url,
@@ -785,27 +786,6 @@ impl EventHandler for Handler {
         }
 
         if !failed_image_files.is_empty() {
-            let warn_channel = ChannelRef {
-                platform: "discord".into(),
-                channel_id: msg.channel_id.get().to_string(),
-                thread_id: None,
-                parent_id: None,
-                origin_event_id: None,
-            };
-            // Sanitize filenames before embedding in the user-visible message:
-            // backticks close Discord code spans and <> enable mention injection.
-            let file_list = failed_image_files
-                .iter()
-                .map(|n| n.replace('`', "'").replace('<', "(").replace('>', ")"))
-                .collect::<Vec<_>>()
-                .join("`, `");
-            let warn_msg = format!(
-                ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
-                 Supported formats are PNG / JPEG / GIF / WebP up to 10 MB."
-            );
-            if let Err(e) = adapter.send_message(&warn_channel, &warn_msg).await {
-                warn!(error = %e, "failed to send image validation warning to user");
-            }
             extra_blocks.push(ContentBlock::Text {
                 text: media::format_failed_attachment_note(&failed_image_files),
             });
@@ -836,6 +816,28 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        // Send user-visible warning into the correct thread now that we know where it is.
+        // For top-level channel messages, thread_channel is the newly-created thread —
+        // not msg.channel_id. Sending before get_or_create_thread would route to the parent.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| sanitize_discord_filename(n))
+                .collect::<Vec<_>>()
+                .join("`, `");
+            let warn_msg = format!(
+                ":warning: I couldn't process the file(s) you shared (`{file_list}`). \
+                 Supported formats are PNG / JPEG / GIF / WebP up to 10 MB."
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                warn!(
+                    channel_id = %msg.channel_id,
+                    error = %e,
+                    "failed to send image validation warning to user"
+                );
+            }
+        }
 
         let trigger_msg = discord_msg_ref(&msg);
 
@@ -1420,6 +1422,14 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     out.trim().to_string()
 }
 
+/// Sanitize a filename for safe embedding in a Discord message.
+///
+/// Backticks close Discord code spans; angle brackets enable mention injection
+/// (`@here`, `@everyone`, `<@uid>` — Discord parses these inside code spans too).
+fn sanitize_discord_filename(s: &str) -> String {
+    s.replace('`', "'").replace('<', "(").replace('>', ")")
+}
+
 fn video_attachment_block(
     filename: &str,
     content_type: Option<&str>,
@@ -1576,6 +1586,24 @@ fn should_process_user_message(
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
+
+    // --- sanitize_discord_filename tests ---
+
+    #[test]
+    fn sanitize_discord_leaves_normal_filename_unchanged() {
+        assert_eq!(sanitize_discord_filename("photo.png"), "photo.png");
+        assert_eq!(sanitize_discord_filename("my file (1).jpg"), "my file (1).jpg");
+    }
+
+    #[test]
+    fn sanitize_discord_replaces_backtick() {
+        assert_eq!(sanitize_discord_filename("file`name.png"), "file'name.png");
+    }
+
+    #[test]
+    fn sanitize_discord_combined_injection_attempt() {
+        assert_eq!(sanitize_discord_filename("`<!here>`"), "'(!here)'");
+    }
 
     // --- resolve_mentions tests ---
 
