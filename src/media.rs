@@ -6,7 +6,7 @@ use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, ImageReader};
 use std::io::Cursor;
 use std::sync::LazyLock;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Reusable HTTP client for downloading attachments (shared across adapters).
 pub static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -78,6 +78,9 @@ pub(crate) fn sanitize_attachment_filename(s: &str) -> String {
 
 /// Build a `[Attachment validation failed]` note for injection into the agent prompt
 /// so the agent's reply acknowledges the failure instead of asking "where's the image?".
+///
+/// Filenames are sanitized via `sanitize_attachment_filename` internally; callers
+/// should pass raw (unsanitized) strings.
 pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     let list = filenames
         .iter()
@@ -92,8 +95,11 @@ pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     )
 }
 
-/// Returns the entry to push into `failed_image_files` for the given error, or
+/// Returns the filename to push into `failed_image_files` for the given error, or
 /// `None` if the error is transient / network-level and should only be logged.
+///
+/// Returns `None` for `NotAnImage` too — that is a deliberate silent skip (the
+/// attachment simply isn't an image), not a transient failure.
 ///
 /// HTTP 4xx responses are treated as permanent-ish failures (missing scope,
 /// revoked credentials, expired URL) and warrant user notification.  HTTP 5xx
@@ -101,19 +107,16 @@ pub fn format_failed_attachment_note(filenames: &[String]) -> String {
 pub(crate) fn failed_attachment_entry(filename: &str, e: &MediaFetchError) -> Option<String> {
     match e {
         MediaFetchError::NotAnImage => None,
-        MediaFetchError::SizeExceeded { limit, .. } => {
-            Some(format!("{filename} (exceeds {limit} byte limit)"))
-        }
-        MediaFetchError::UnsupportedResponseType { .. }
+        MediaFetchError::SizeExceeded { .. }
+        | MediaFetchError::UnsupportedResponseType { .. }
         | MediaFetchError::InvalidImageBody { .. }
         | MediaFetchError::ProcessingFailed(_) => Some(filename.to_string()),
         MediaFetchError::HttpStatus(status) if status.is_client_error() => {
             Some(filename.to_string())
         }
-        // Network(_) and HttpStatus 5xx are transient; log-only, no user notification.
-        // Any future MediaFetchError variant added to the enum will land here by
-        // default — if a new variant represents a permanent failure, add an explicit arm.
-        _ => None,
+        // Network errors and non-4xx HTTP status are transient; log-only, no user notification.
+        MediaFetchError::Network(_) => None,
+        MediaFetchError::HttpStatus(_) => None,
     }
 }
 
@@ -334,8 +337,12 @@ fn encode_validated_image(
     let (output_bytes, output_mime) = match resize_and_compress(bytes) {
         Ok(result) => result,
         Err(e) => {
-            if bytes.len() <= 1024 * 1024 {
-                debug!(filename, error = %e, "resize failed, using validated original");
+            // Only fall back to raw bytes for small WebP files — the one known case
+            // where a file passes magic-byte validation but resize fails (animated
+            // WebP that the image crate cannot decode). Other formats that fail
+            // resize are treated as corrupt and surfaced as ProcessingFailed.
+            if bytes.len() <= 1024 * 1024 && mime == "image/webp" {
+                warn!(filename, error = %e, "resize failed on WebP, using validated original");
                 (bytes.to_vec(), mime.to_string())
             } else {
                 error!(
@@ -875,9 +882,9 @@ mod tests {
     }
 
     #[test]
-    fn format_failed_attachment_note_preserves_size_suffix() {
-        let note = super::format_failed_attachment_note(&["big.png (exceeds 10000000 byte limit)".to_string()]);
-        assert!(note.contains("`big.png (exceeds 10000000 byte limit)`"));
+    fn format_failed_attachment_note_wraps_filename_in_backticks() {
+        let note = super::format_failed_attachment_note(&["big.png".to_string()]);
+        assert!(note.contains("`big.png`"));
     }
 
     #[test]
@@ -925,6 +932,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resize_fail_non_webp_always_returns_processing_failed() {
+        // A non-WebP file with decode failure must always return ProcessingFailed,
+        // even if small — the animated-WebP fallback must not fire for other formats.
+        let bytes = make_webp_stub(); // 12 bytes — well under 1 MB
+        let result = encode_validated_image(&bytes, "image/png", "corrupt.png");
+        assert!(
+            matches!(result, Err(MediaFetchError::ProcessingFailed(_))),
+            "expected ProcessingFailed for non-WebP resize failure, got {result:?}"
+        );
+    }
+
     // --- failed_attachment_entry tests ---
 
     #[test]
@@ -934,10 +953,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_attachment_entry_size_exceeded_includes_limit() {
+    fn failed_attachment_entry_size_exceeded_notifies_user() {
         let e = MediaFetchError::SizeExceeded { actual: 20_000_000, limit: 10_000_000 };
         let entry = failed_attachment_entry("big.png", &e).unwrap();
-        assert_eq!(entry, "big.png (exceeds 10000000 byte limit)");
+        assert_eq!(entry, "big.png");
     }
 
     #[test]

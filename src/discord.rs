@@ -764,12 +764,6 @@ impl EventHandler for Handler {
             }
         }
 
-        if !failed_image_files.is_empty() {
-            extra_blocks.push(ContentBlock::Text {
-                text: media::format_failed_attachment_note(&failed_image_files),
-            });
-        }
-
         tracing::debug!(
             num_extra_blocks = extra_blocks.len(),
             num_attachments = msg.attachments.len(),
@@ -790,15 +784,24 @@ impl EventHandler for Handler {
             match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
                 Ok(ch) => ch,
                 Err(e) => {
-                    // Thread creation failed — entire message is dropped. The user
-                    // sees no reply and no warning (same as any other failed message).
-                    // The failed_image_files warning is NOT sent here because we have
-                    // no thread to target and the agent won't run anyway.
+                    // Thread creation failed — entire message is dropped. No reply,
+                    // no warning, no agent note. The failed_image_files warning and
+                    // agent note are NOT sent here: we have no thread to target and
+                    // the agent won't run anyway.
                     error!("failed to create thread: {e}");
                     return;
                 }
             }
         };
+
+        // Agent note and user warning are sent together or not at all.
+        // Push the agent note here (after thread_channel is resolved) so a
+        // thread-creation failure above silences both, keeping them in sync.
+        if !failed_image_files.is_empty() {
+            extra_blocks.push(ContentBlock::Text {
+                text: media::format_failed_attachment_note(&failed_image_files),
+            });
+        }
 
         // Send user-visible warning into the correct thread now that we know where it is.
         // For top-level channel messages, thread_channel is the newly-created thread —
@@ -1405,8 +1408,6 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     out.trim().to_string()
 }
 
-/// Sanitize a filename for safe embedding in a Discord message.
-///
 /// Sanitize a filename for safe embedding in a Discord message.
 ///
 /// Delegates to `media::sanitize_attachment_filename` so the escaping rules

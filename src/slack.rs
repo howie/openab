@@ -1084,9 +1084,10 @@ async fn handle_message(
         if let Err(e) = adapter.send_message(&warn_channel, &msg).await {
             warn!(error = %e, "failed to send image validation warning to user");
         }
-        // push (not insert) is correct: pack_arrival_event partitions Text blocks before
-        // the typed prompt regardless, so this note lands after STT transcripts but
-        // before the user's message — the right slot for agent-side meta-context.
+        // push (not insert) is correct: pack_arrival_event places all Text extras before
+        // the typed prompt. The note lands after STT transcripts because STT uses
+        // insert(0, ...) at the front of extra_blocks — that convention must be preserved
+        // if the STT insertion point ever changes.
         extra_blocks.push(ContentBlock::Text {
             text: media::format_failed_attachment_note(&failed_image_files),
         });
