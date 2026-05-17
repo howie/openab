@@ -739,47 +739,26 @@ impl EventHandler for Handler {
                             ));
                         }
                     }
-                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            actual,
-                            limit,
-                            "image exceeds size limit"
-                        );
-                        failed_image_files.push(format!(
-                            "{} (exceeds {limit} byte limit)",
-                            attachment.filename
-                        ));
-                    }
-                    Err(
-                        media::MediaFetchError::UnsupportedResponseType { .. }
-                        | media::MediaFetchError::InvalidImageBody { .. },
-                    ) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            "image validation failed; body is not a supported image"
-                        );
-                        failed_image_files.push(attachment.filename.clone());
-                    }
-                    Err(media::MediaFetchError::ProcessingFailed(e)) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            error = %e,
-                            "image post-processing failed"
-                        );
-                        failed_image_files.push(attachment.filename.clone());
-                    }
-                    // Network/HTTP failures: transient; warn in logs only, don't notify user.
                     Err(e) => {
-                        tracing::warn!(
-                            url = %attachment.url,
-                            filename = %attachment.filename,
-                            error = %e,
-                            "image attachment failed"
-                        );
+                        if let Some(entry) =
+                            media::failed_attachment_entry(&attachment.filename, &e)
+                        {
+                            tracing::warn!(
+                                url = %attachment.url,
+                                filename = %attachment.filename,
+                                error = %e,
+                                "image attachment failed"
+                            );
+                            failed_image_files.push(entry);
+                        } else {
+                            // Network/HTTP 5xx failures: transient; warn in logs only.
+                            tracing::warn!(
+                                url = %attachment.url,
+                                filename = %attachment.filename,
+                                error = %e,
+                                "image download failed"
+                            );
+                        }
                     }
                 }
             }
@@ -2245,5 +2224,23 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    // --- failed_attachment_entry parity tests (mirrors media::tests) ---
+
+    /// HTTP 4xx from Discord CDN (e.g. expired signed URL) must push into
+    /// failed_image_files so the user gets a warning and the agent is notified.
+    #[test]
+    fn discord_failed_attachment_entry_http_4xx_notifies_user() {
+        let e = media::MediaFetchError::HttpStatus(reqwest::StatusCode::FORBIDDEN);
+        let entry = media::failed_attachment_entry("photo.png", &e).unwrap();
+        assert_eq!(entry, "photo.png");
+    }
+
+    /// HTTP 5xx is transient; should not notify the user.
+    #[test]
+    fn discord_failed_attachment_entry_http_5xx_is_logged_only() {
+        let e = media::MediaFetchError::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(media::failed_attachment_entry("photo.png", &e).is_none());
     }
 }

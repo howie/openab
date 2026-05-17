@@ -83,6 +83,28 @@ pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     )
 }
 
+/// Returns the entry to push into `failed_image_files` for the given error, or
+/// `None` if the error is transient / network-level and should only be logged.
+///
+/// HTTP 4xx responses are treated as permanent-ish failures (missing scope,
+/// revoked credentials, expired URL) and warrant user notification.  HTTP 5xx
+/// and network errors are transient and are logged only.
+pub(crate) fn failed_attachment_entry(filename: &str, e: &MediaFetchError) -> Option<String> {
+    match e {
+        MediaFetchError::NotAnImage => None,
+        MediaFetchError::SizeExceeded { limit, .. } => {
+            Some(format!("{filename} (exceeds {limit} byte limit)"))
+        }
+        MediaFetchError::UnsupportedResponseType { .. }
+        | MediaFetchError::InvalidImageBody { .. }
+        | MediaFetchError::ProcessingFailed(_) => Some(filename.to_string()),
+        MediaFetchError::HttpStatus(status) if status.is_client_error() => {
+            Some(filename.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Strip MIME parameters and trim whitespace.  `"image/png; charset=binary"` → `"image/png"`.
 pub(crate) fn strip_mime_params(mime: &str) -> &str {
     mime.split(';').next().unwrap_or(mime).trim()
@@ -285,7 +307,19 @@ pub async fn download_and_encode_image(
         return Err(e);
     }
 
-    let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
+    encode_validated_image(&bytes, mime, filename)
+}
+
+/// Resize, compress and Base64-encode bytes that have already passed
+/// `validate_image_response`.  On resize failure, falls back to the raw
+/// validated bytes when the body is ≤ 1 MB (e.g. animated WebP that the
+/// image crate cannot decode but is small enough to pass through).
+fn encode_validated_image(
+    bytes: &[u8],
+    mime: &str,
+    filename: &str,
+) -> Result<ContentBlock, MediaFetchError> {
+    let (output_bytes, output_mime) = match resize_and_compress(bytes) {
         Ok(result) => result,
         Err(e) => {
             if bytes.len() <= 1024 * 1024 {
@@ -840,5 +874,78 @@ mod tests {
         // Backtick in filename is replaced with single-quote to avoid breaking the code-span.
         assert!(note.contains("`fi'le.png`"));
         assert!(!note.contains("``"));
+    }
+
+    // --- encode_validated_image: resize-fallback threshold tests ---
+
+    /// Minimal WebP header stub: RIFF magic + WEBP FourCC.
+    /// `validate_image_response` accepts it (format detected as WebP);
+    /// `resize_and_compress`'s `decode()` fails because there are no VP8 chunks.
+    /// Generated inline — no copyright concern.
+    fn make_webp_stub() -> Vec<u8> {
+        b"RIFF\x00\x00\x00\x00WEBP".to_vec()
+    }
+
+    #[test]
+    fn resize_fail_under_1mb_falls_back_to_original_bytes() {
+        let bytes = make_webp_stub(); // 12 bytes << 1 MB
+        let result = encode_validated_image(&bytes, "image/webp", "test.webp");
+        let block = result.expect("should fall back to original bytes, not error");
+        match block {
+            ContentBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/webp");
+                // Data is Base64 of the original stub bytes.
+                let decoded = BASE64.decode(&data).expect("valid Base64");
+                assert_eq!(decoded, bytes);
+            }
+            other => panic!("expected ContentBlock::Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_fail_over_1mb_returns_processing_failed() {
+        let mut bytes = make_webp_stub();
+        // Pad to just over 1 MB so the >1 MB branch fires.
+        bytes.resize(1024 * 1024 + 1, 0x00);
+        let result = encode_validated_image(&bytes, "image/webp", "big.webp");
+        assert!(
+            matches!(result, Err(MediaFetchError::ProcessingFailed(_))),
+            "expected ProcessingFailed for >1MB resize failure, got {result:?}"
+        );
+    }
+
+    // --- failed_attachment_entry tests ---
+
+    #[test]
+    fn failed_attachment_entry_not_an_image_returns_none() {
+        let e = MediaFetchError::NotAnImage;
+        assert!(failed_attachment_entry("img.png", &e).is_none());
+    }
+
+    #[test]
+    fn failed_attachment_entry_size_exceeded_includes_limit() {
+        let e = MediaFetchError::SizeExceeded { actual: 20_000_000, limit: 10_000_000 };
+        let entry = failed_attachment_entry("big.png", &e).unwrap();
+        assert_eq!(entry, "big.png (exceeds 10000000 byte limit)");
+    }
+
+    #[test]
+    fn failed_attachment_entry_http_4xx_notifies_user() {
+        let e = MediaFetchError::HttpStatus(reqwest::StatusCode::FORBIDDEN);
+        let entry = failed_attachment_entry("photo.png", &e).unwrap();
+        assert_eq!(entry, "photo.png");
+    }
+
+    #[test]
+    fn failed_attachment_entry_http_5xx_is_logged_only() {
+        let e = MediaFetchError::HttpStatus(reqwest::StatusCode::BAD_GATEWAY);
+        assert!(failed_attachment_entry("photo.png", &e).is_none());
+    }
+
+    #[test]
+    fn failed_attachment_entry_http_401_notifies_user() {
+        let e = MediaFetchError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED);
+        let entry = failed_attachment_entry("secret.png", &e).unwrap();
+        assert_eq!(entry, "secret.png");
     }
 }

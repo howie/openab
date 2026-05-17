@@ -1048,32 +1048,13 @@ async fn handle_message(
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {}
-                    Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
-                        warn!(filename, actual, limit, "image exceeds size limit");
-                        failed_image_files.push(format!("{filename} (exceeds {limit} byte limit)"));
-                    }
-                    Err(
-                        media::MediaFetchError::UnsupportedResponseType { .. }
-                        | media::MediaFetchError::InvalidImageBody { .. },
-                    ) => {
-                        warn!(
-                            filename,
-                            "image validation failed; server may have returned non-image content"
-                        );
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
-                        warn!(filename, error = %e, "image post-processing failed");
-                        failed_image_files.push(filename.to_string());
-                    }
-                    Err(media::MediaFetchError::HttpStatus(status))
-                        if status.is_client_error() =>
-                    {
-                        warn!(filename, %status, "image download denied");
-                        failed_image_files.push(filename.to_string());
-                    }
                     Err(e) => {
-                        warn!(filename, error = %e, "image download failed");
+                        if let Some(entry) = media::failed_attachment_entry(filename, &e) {
+                            warn!(filename, error = %e, "image attachment failed");
+                            failed_image_files.push(entry);
+                        } else {
+                            warn!(filename, error = %e, "image download failed");
+                        }
                     }
                 }
             }
