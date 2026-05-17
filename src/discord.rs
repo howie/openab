@@ -1407,10 +1407,12 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
 
 /// Sanitize a filename for safe embedding in a Discord message.
 ///
-/// Backticks close Discord code spans; angle brackets enable mention injection
-/// (`@here`, `@everyone`, `<@uid>` — Discord parses these inside code spans too).
+/// Sanitize a filename for safe embedding in a Discord message.
+///
+/// Delegates to `media::sanitize_attachment_filename` so the escaping rules
+/// stay in one place for both Slack and Discord.
 fn sanitize_discord_filename(s: &str) -> String {
-    s.replace('`', "'").replace('<', "(").replace('>', ")")
+    media::sanitize_attachment_filename(s)
 }
 
 fn video_attachment_block(
@@ -2226,21 +2228,4 @@ mod tests {
         assert!(!should_skip_thread_creation(false, false));
     }
 
-    // --- failed_attachment_entry parity tests (mirrors media::tests) ---
-
-    /// HTTP 4xx from Discord CDN (e.g. expired signed URL) must push into
-    /// failed_image_files so the user gets a warning and the agent is notified.
-    #[test]
-    fn discord_failed_attachment_entry_http_4xx_notifies_user() {
-        let e = media::MediaFetchError::HttpStatus(reqwest::StatusCode::FORBIDDEN);
-        let entry = media::failed_attachment_entry("photo.png", &e).unwrap();
-        assert_eq!(entry, "photo.png");
-    }
-
-    /// HTTP 5xx is transient; should not notify the user.
-    #[test]
-    fn discord_failed_attachment_entry_http_5xx_is_logged_only() {
-        let e = media::MediaFetchError::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(media::failed_attachment_entry("photo.png", &e).is_none());
-    }
 }

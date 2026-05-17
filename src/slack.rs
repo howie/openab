@@ -1219,11 +1219,10 @@ fn strip_mime_params(mimetype: &str) -> &str {
 
 /// Sanitize a filename for safe embedding in a Slack mrkdwn message.
 ///
-/// Backticks (`) and angle brackets (`<`, `>`) are Slack markup delimiters.
-/// Without sanitization, a user-controlled filename such as `<!here>` or
-/// `` `<@U123>` `` would be rendered as a Slack mention or @-here ping.
+/// Delegates to `media::sanitize_attachment_filename` so the escaping rules
+/// stay in one place for both Slack and Discord.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
-    s.replace('`', "'").replace('<', "(").replace('>', ")")
+    media::sanitize_attachment_filename(s)
 }
 
 /// True only when a Slack non-bot event represents a real user message

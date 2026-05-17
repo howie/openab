@@ -67,12 +67,21 @@ impl std::fmt::Display for MediaFetchError {
     }
 }
 
+/// Sanitize a user-controlled filename before embedding in adapter warnings or
+/// agent-prompt notes.  Replaces characters that function as markup delimiters
+/// in Slack mrkdwn, Discord markdown, and LLM code-spans:
+/// - `` ` `` → `'` (closes code spans in all three contexts)
+/// - `<` → `(`, `>` → `)` (disables `<!here>`, `<@uid>` mention injection)
+pub(crate) fn sanitize_attachment_filename(s: &str) -> String {
+    s.replace('`', "'").replace('<', "(").replace('>', ")")
+}
+
 /// Build a `[Attachment validation failed]` note for injection into the agent prompt
 /// so the agent's reply acknowledges the failure instead of asking "where's the image?".
 pub fn format_failed_attachment_note(filenames: &[String]) -> String {
     let list = filenames
         .iter()
-        .map(|n| format!("`{}`", n.replace('`', "'")))
+        .map(|n| format!("`{}`", sanitize_attachment_filename(n)))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -101,6 +110,9 @@ pub(crate) fn failed_attachment_entry(filename: &str, e: &MediaFetchError) -> Op
         MediaFetchError::HttpStatus(status) if status.is_client_error() => {
             Some(filename.to_string())
         }
+        // Network(_) and HttpStatus 5xx are transient; log-only, no user notification.
+        // Any future MediaFetchError variant added to the enum will land here by
+        // default — if a new variant represents a permanent failure, add an explicit arm.
         _ => None,
     }
 }
@@ -881,7 +893,6 @@ mod tests {
     /// Minimal WebP header stub: RIFF magic + WEBP FourCC.
     /// `validate_image_response` accepts it (format detected as WebP);
     /// `resize_and_compress`'s `decode()` fails because there are no VP8 chunks.
-    /// Generated inline — no copyright concern.
     fn make_webp_stub() -> Vec<u8> {
         b"RIFF\x00\x00\x00\x00WEBP".to_vec()
     }
