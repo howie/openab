@@ -98,11 +98,15 @@ impl StatusReactionController {
         }
         let emoji = { self.inner.lock().await.emojis.done.clone() };
         self.finish(&emoji).await;
-        // Add a random mood face
+        // Add a random mood face — only if finish() actually ran (inner.current == emoji).
+        // If suppress() was called first, finished=true and current was cleared, so
+        // current != emoji and we skip the face to avoid reacting on a suppressed reply.
         let faces = ["😊", "😎", "🫡", "🤓", "😏", "✌️", "💪", "🦾"];
         let face = faces[rand::random::<usize>() % faces.len()];
         let inner = self.inner.lock().await;
-        let _ = inner.adapter.add_reaction(&inner.message, face).await;
+        if inner.current == emoji {
+            let _ = inner.adapter.add_reaction(&inner.message, face).await;
+        }
     }
 
     pub async fn set_error(&self) {
@@ -118,6 +122,9 @@ impl StatusReactionController {
             return;
         }
         let mut inner = self.inner.lock().await;
+        if inner.finished {
+            return;
+        }
         cancel_timers(&mut inner);
         let current = inner.current.clone();
         if !current.is_empty() {
@@ -142,10 +149,9 @@ impl StatusReactionController {
         cancel_timers(&mut inner);
         let current = inner.current.clone();
         if !current.is_empty() {
-            let _ = inner
-                .adapter
-                .remove_reaction(&inner.message, &current)
-                .await;
+            if let Err(e) = inner.adapter.remove_reaction(&inner.message, &current).await {
+                tracing::warn!(error = ?e, "suppress: failed to remove reaction");
+            }
             inner.current.clear();
         }
     }
@@ -293,5 +299,109 @@ fn cancel_timers(inner: &mut Inner) {
     }
     if let Some(h) = inner.stall_hard_handle.take() {
         h.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{ChannelRef, MessageRef};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Minimal mock adapter that records add_reaction / remove_reaction calls.
+    struct MockAdapter {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockAdapter {
+        fn new() -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (Arc::new(Self { calls: calls.clone() }), calls)
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for MockAdapter {
+        fn platform(&self) -> &'static str { "mock" }
+        fn message_limit(&self) -> usize { 2000 }
+        async fn send_message(&self, _ch: &ChannelRef, _content: &str) -> anyhow::Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(&self, _ch: &ChannelRef, _trigger: &MessageRef, _title: &str) -> anyhow::Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+            self.calls.lock().await.push(format!("add:{emoji}"));
+            Ok(())
+        }
+        async fn remove_reaction(&self, _msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+            self.calls.lock().await.push(format!("remove:{emoji}"));
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool { false }
+    }
+
+    fn make_message_ref() -> MessageRef {
+        MessageRef {
+            channel: ChannelRef {
+                platform: "mock".into(),
+                channel_id: "C1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "M1".into(),
+        }
+    }
+
+    fn make_controller(adapter: Arc<dyn ChatAdapter>) -> StatusReactionController {
+        StatusReactionController::new(
+            true,
+            adapter,
+            make_message_ref(),
+            ReactionEmojis::default(),
+            ReactionTiming::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn suppress_removes_current_reaction_and_blocks_set_done() {
+        let (adapter, calls) = MockAdapter::new();
+        let ctrl = make_controller(adapter);
+
+        // set_queued uses apply_immediate (no debounce) so the reaction is
+        // present synchronously before suppress() is called.
+        ctrl.set_queued().await;
+
+        ctrl.suppress().await;
+
+        // suppress() must remove the current reaction
+        let snapshot = calls.lock().await.clone();
+        let removed = snapshot.iter().any(|c| c.starts_with("remove:"));
+        assert!(removed, "suppress() should remove the current reaction; calls: {snapshot:?}");
+
+        // set_done() must be a no-op after suppress()
+        ctrl.set_done().await;
+        let after_done = calls.lock().await.clone();
+        let new_adds: Vec<_> = after_done[snapshot.len()..].iter().filter(|c| c.starts_with("add:")).collect();
+        assert!(new_adds.is_empty(), "set_done() must be no-op after suppress(); new add calls: {new_adds:?}");
+    }
+
+    #[tokio::test]
+    async fn clear_is_no_op_after_suppress() {
+        let (adapter, calls) = MockAdapter::new();
+        let ctrl = make_controller(adapter);
+
+        ctrl.set_queued().await;
+
+        ctrl.suppress().await;
+        let after_suppress = calls.lock().await.len();
+
+        // clear() must not fire additional API calls after suppress()
+        ctrl.clear().await;
+        let after_clear = calls.lock().await.len();
+        assert_eq!(after_suppress, after_clear, "clear() must be no-op after suppress()");
     }
 }

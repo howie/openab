@@ -590,16 +590,22 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    // Don't stream potential-sentinel content to the edit
+                                    // loop — if the agent is outputting <silent /> the
+                                    // placeholder should stay as "…" until delete fires,
+                                    // not flash the literal sentinel text to users.
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(format!(
-                                            "{reset_prelude}{}",
-                                            compose_display(
-                                                &tool_lines,
-                                                &text_buf,
-                                                true,
-                                                tool_display,
-                                            )
-                                        ));
+                                        if text_buf.trim() != "<silent />" {
+                                            let _ = tx.send(format!(
+                                                "{reset_prelude}{}",
+                                                compose_display(
+                                                    &tool_lines,
+                                                    &text_buf,
+                                                    true,
+                                                    tool_display,
+                                                )
+                                            ));
+                                        }
                                     }
                                 }
                                 AcpEvent::Thinking => {
