@@ -524,6 +524,7 @@ impl Default for ReactionsConfig {
             tool_display: ToolDisplay::default(),
             emojis: ReactionEmojis::default(),
             timing: ReactionTiming::default(),
+            empty_reply_placeholder: true,
         }
     }
 }
