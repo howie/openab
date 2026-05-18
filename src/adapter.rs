@@ -478,10 +478,14 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
-
-                    if reset {
-                        text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
-                    }
+                    // Kept separate from text_buf so the sentinel check ("is the
+                    // agent's actual output <silent />?") is not confused by the
+                    // synthetic prelude. Prepended to final_content before send.
+                    let reset_prelude = if reset {
+                        "⚠️ _Session expired, starting fresh..._\n\n"
+                    } else {
+                        ""
+                    };
 
                     // Streaming edit: send placeholder, spawn edit loop
                     let (buf_tx, placeholder_msg) = if streaming {
@@ -587,11 +591,14 @@ impl AdapterRouter {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
-                                            &tool_lines,
-                                            &text_buf,
-                                            true,
-                                            tool_display,
+                                        let _ = tx.send(format!(
+                                            "{reset_prelude}{}",
+                                            compose_display(
+                                                &tool_lines,
+                                                &text_buf,
+                                                true,
+                                                tool_display,
+                                            )
                                         ));
                                     }
                                 }
@@ -612,11 +619,14 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
-                                            &tool_lines,
-                                            &text_buf,
-                                            true,
-                                            tool_display,
+                                        let _ = tx.send(format!(
+                                            "{reset_prelude}{}",
+                                            compose_display(
+                                                &tool_lines,
+                                                &text_buf,
+                                                true,
+                                                tool_display,
+                                            )
                                         ));
                                     }
                                 }
@@ -640,11 +650,14 @@ impl AdapterRouter {
                                         });
                                     }
                                     if let Some(tx) = &buf_tx {
-                                        let _ = tx.send(compose_display(
-                                            &tool_lines,
-                                            &text_buf,
-                                            true,
-                                            tool_display,
+                                        let _ = tx.send(format!(
+                                            "{reset_prelude}{}",
+                                            compose_display(
+                                                &tool_lines,
+                                                &text_buf,
+                                                true,
+                                                tool_display,
+                                            )
                                         ));
                                     }
                                 }
@@ -669,9 +682,14 @@ impl AdapterRouter {
                     // Sentinel: checked post-loop — chunks may transiently match mid-stream.
                     if text_buf.trim() == "<silent />" {
                         info!(platform = %adapter.platform(), "agent emitted <silent /> sentinel -- suppressing reply");
+                        reactions.suppress().await;
                         if let Some(msg) = placeholder_msg {
                             let a = adapter.clone();
-                            tokio::spawn(async move { let _ = a.delete_message(&msg).await; });
+                            tokio::spawn(async move {
+                                if let Err(e) = a.delete_message(&msg).await {
+                                    warn!(error = ?e, "delete placeholder failed after silent sentinel");
+                                }
+                            });
                         }
                         return Ok(());
                     }
@@ -684,9 +702,14 @@ impl AdapterRouter {
                             format!("⚠️ {err}")
                         } else if !empty_reply_placeholder {
                             debug!(platform = %adapter.platform(), "empty reply suppressed; empty_reply_placeholder disabled");
+                            reactions.suppress().await;
                             if let Some(msg) = placeholder_msg {
                                 let a = adapter.clone();
-                                tokio::spawn(async move { let _ = a.delete_message(&msg).await; });
+                                tokio::spawn(async move {
+                                    if let Err(e) = a.delete_message(&msg).await {
+                                        warn!(error = ?e, "delete placeholder failed after empty reply suppression");
+                                    }
+                                });
                             }
                             return Ok(());
                         } else {
@@ -698,6 +721,7 @@ impl AdapterRouter {
                         final_content
                     };
 
+                    let final_content = format!("{reset_prelude}{final_content}");
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {

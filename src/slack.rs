@@ -447,6 +447,18 @@ impl ChatAdapter for SlackAdapter {
         }
     }
 
+    async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        self.api_post(
+            "chat.delete",
+            serde_json::json!({
+                "channel": msg.channel.channel_id,
+                "ts": msg.message_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
         let mrkdwn = markdown_to_mrkdwn(content);
         self.api_post(

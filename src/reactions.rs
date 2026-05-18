@@ -129,6 +129,27 @@ impl StatusReactionController {
         }
     }
 
+    /// Remove the current reaction, cancel all timers, and mark as finished so
+    /// subsequent set_done/set_error calls are no-ops. Used when a reply is
+    /// suppressed (sentinel or empty_reply_placeholder=false) — prevents the
+    /// done emoji from appearing on a message the user never saw a reply for.
+    pub async fn suppress(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        inner.finished = true;
+        cancel_timers(&mut inner);
+        let current = inner.current.clone();
+        if !current.is_empty() {
+            let _ = inner
+                .adapter
+                .remove_reaction(&inner.message, &current)
+                .await;
+            inner.current.clear();
+        }
+    }
+
     async fn apply_immediate(&self, emoji: &str) {
         let mut inner = self.inner.lock().await;
         if inner.finished || emoji == inner.current {
