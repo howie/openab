@@ -666,13 +666,12 @@ impl AdapterRouter {
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
                     let text_buf = stripped_text;
 
-                    // Sentinel: agent explicitly chose silence — suppress reply and clean up placeholder.
-                    // Checked post-loop on the complete buffer; individual streaming chunks may
-                    // transiently contain this substring and must not be filtered mid-stream.
+                    // Sentinel: checked post-loop — chunks may transiently match mid-stream.
                     if text_buf.trim() == "<silent />" {
                         info!(platform = %adapter.platform(), "agent emitted <silent /> sentinel -- suppressing reply");
-                        if let Some(msg) = placeholder_msg.as_ref() {
-                            let _ = adapter.delete_message(msg).await;
+                        if let Some(msg) = placeholder_msg {
+                            let a = adapter.clone();
+                            tokio::spawn(async move { let _ = a.delete_message(&msg).await; });
                         }
                         return Ok(());
                     }
@@ -684,9 +683,10 @@ impl AdapterRouter {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
                         } else if !empty_reply_placeholder {
-                            debug!(platform = %adapter.platform(), "empty reply suppressed by empty_reply_placeholder=false");
-                            if let Some(msg) = placeholder_msg.as_ref() {
-                                let _ = adapter.delete_message(msg).await;
+                            debug!(platform = %adapter.platform(), "empty reply suppressed; empty_reply_placeholder disabled");
+                            if let Some(msg) = placeholder_msg {
+                                let a = adapter.clone();
+                                tokio::spawn(async move { let _ = a.delete_message(&msg).await; });
                             }
                             return Ok(());
                         } else {
