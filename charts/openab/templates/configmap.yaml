@@ -162,6 +162,7 @@ data:
     [reactions]
     enabled = {{ if hasKey ($cfg.reactions) "enabled" }}{{ ($cfg.reactions).enabled }}{{ else }}true{{ end }}
     remove_after_reply = {{ if hasKey ($cfg.reactions) "removeAfterReply" }}{{ ($cfg.reactions).removeAfterReply }}{{ else }}false{{ end }}
+    empty_reply_placeholder = {{ if hasKey ($cfg.reactions) "emptyReplyPlaceholder" }}{{ ($cfg.reactions).emptyReplyPlaceholder }}{{ else }}true{{ end }}
     {{- if ($cfg.reactions).toolDisplay }}
     {{- if not (has ($cfg.reactions).toolDisplay (list "full" "compact" "none")) }}
     {{- fail (printf "agents.%s.reactions.toolDisplay must be one of: full, compact, none — got: %s" $name ($cfg.reactions).toolDisplay) }}

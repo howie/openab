@@ -408,6 +408,10 @@ pub struct ReactionsConfig {
     pub emojis: ReactionEmojis,
     #[serde(default)]
     pub timing: ReactionTiming,
+    /// When false, empty replies (no error) are silently suppressed instead of
+    /// posting "_(no response)_". Default true preserves existing behaviour.
+    #[serde(default = "default_true")]
+    pub empty_reply_placeholder: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -921,5 +925,28 @@ echo_transcript = false
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
+    }
+
+    #[test]
+    fn empty_reply_placeholder_defaults_to_true() {
+        let toml = r#"
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.reactions.empty_reply_placeholder, "default must be true for backward compat");
+    }
+
+    #[test]
+    fn empty_reply_placeholder_can_be_set_to_false() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[reactions]
+empty_reply_placeholder = false
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(!cfg.reactions.empty_reply_placeholder);
     }
 }

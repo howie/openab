@@ -282,6 +282,8 @@ agents:
       # compact: show count summary (e.g. ✅ 3 · 🔧 1 tool(s))
       # full: show complete tool titles (for debugging)
       # none: hide tool lines entirely
+      # emptyReplyPlaceholder: true  # set to false to silently suppress empty replies
+      #   instead of posting "_(no response)_". Pairs with <silent /> sentinel steering.
     stt:
       enabled: false
       apiKey: ""

@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
 use crate::config::{ReactionsConfig, ToolDisplay};
@@ -462,6 +462,7 @@ impl AdapterRouter {
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
+        let empty_reply_placeholder = self.reactions_config.empty_reply_placeholder;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
@@ -540,6 +541,7 @@ impl AdapterRouter {
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
+                                    warn!(platform = %adapter.platform(), "agent process died mid-prompt");
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -548,6 +550,11 @@ impl AdapterRouter {
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
                                     ));
+                                    warn!(
+                                        platform = %adapter.platform(),
+                                        elapsed_s = prompt_start.elapsed().as_secs(),
+                                        "agent hard timeout exceeded"
+                                    );
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -565,6 +572,12 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message));
+                                warn!(
+                                    platform = %adapter.platform(),
+                                    code = err.code,
+                                    message = %err.message,
+                                    "agent JSON-RPC error"
+                                );
                             }
                             break;
                         }
@@ -653,12 +666,29 @@ impl AdapterRouter {
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
                     let text_buf = stripped_text;
 
+                    // Sentinel: agent explicitly chose silence — suppress reply and clean up placeholder.
+                    // Checked post-loop on the complete buffer; individual streaming chunks may
+                    // transiently contain this substring and must not be filtered mid-stream.
+                    if text_buf.trim() == "<silent />" {
+                        info!(platform = %adapter.platform(), "agent emitted <silent /> sentinel -- suppressing reply");
+                        if let Some(msg) = placeholder_msg.as_ref() {
+                            let _ = adapter.delete_message(msg).await;
+                        }
+                        return Ok(());
+                    }
+
                     // Build final content
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
                         if let Some(err) = response_error {
                             format!("⚠️ {err}")
+                        } else if !empty_reply_placeholder {
+                            debug!(platform = %adapter.platform(), "empty reply suppressed by empty_reply_placeholder=false");
+                            if let Some(msg) = placeholder_msg.as_ref() {
+                                let _ = adapter.delete_message(msg).await;
+                            }
+                            return Ok(());
                         } else {
                             "_(no response)_".to_string()
                         }
@@ -1194,5 +1224,27 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    #[test]
+    fn silent_sentinel_passes_through_directive_parser() {
+        // <silent /> is not a [[key:value]] directive — parse_output_directives must
+        // return it unchanged so the post-loop sentinel check can match it.
+        let input = "<silent />";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, None);
+        assert_eq!(content, "<silent />");
+    }
+
+    #[test]
+    fn silent_sentinel_with_whitespace_passes_through() {
+        // Leading/trailing whitespace and newline variants must survive directive parsing.
+        for input in &["  <silent />  ", "<silent />\n", "\n<silent />"] {
+            let (_, content) = parse_output_directives(input);
+            assert!(
+                content.trim() == "<silent />",
+                "expected trimmed content to equal '<silent />' for input {input:?}, got {content:?}"
+            );
+        }
     }
 }
