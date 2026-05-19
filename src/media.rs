@@ -145,10 +145,7 @@ fn hex_prefix(body: &[u8]) -> String {
 /// (`image/*`) because CDNs commonly serve any file type as `application/octet-stream`;
 /// rejecting that header would silently break real downloads. The magic-byte check
 /// examines the actual bytes regardless of what the server claims.
-fn validate_image_response(
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Result<(), MediaFetchError> {
+fn validate_image_response(content_type: Option<&str>, body: &[u8]) -> Result<(), MediaFetchError> {
     // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
     // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
@@ -169,9 +166,8 @@ fn validate_image_response(
     };
 
     match reader.format() {
-        Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP) => {
-            Ok(())
-        }
+        Some(image::ImageFormat::Png | image::ImageFormat::Jpeg) => Ok(()),
+        Some(image::ImageFormat::WebP) => validate_webp_body(body),
         Some(image::ImageFormat::Gif) => {
             validate_gif_body(body).map_err(|e| {
                 debug!(error = %e, "GIF validation failed");
@@ -206,6 +202,68 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
         ))
     })??;
     Ok(())
+}
+
+/// Validate enough of a WebP RIFF container to ensure the body is complete
+/// before we ever allow the raw-byte fallback for small WebP files.
+///
+/// `image::ImageReader::with_guessed_format()` only sniffs `RIFF....WEBP`; it
+/// does not prove that a VP8/VP8L/VP8X chunk exists or that declared chunk sizes
+/// fit within the response body.
+fn validate_webp_body(raw: &[u8]) -> Result<(), MediaFetchError> {
+    fn invalid(raw: &[u8]) -> MediaFetchError {
+        MediaFetchError::InvalidImageBody {
+            magic_prefix_hex: hex_prefix(raw),
+        }
+    }
+
+    if raw.len() < 20 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WEBP" {
+        return Err(invalid(raw));
+    }
+
+    let riff_size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    let declared_len = riff_size.checked_add(8).ok_or_else(|| invalid(raw))?;
+    if declared_len != raw.len() || riff_size < 12 {
+        return Err(invalid(raw));
+    }
+
+    let mut offset = 12usize;
+    let mut has_image_chunk = false;
+    while offset < declared_len {
+        if offset + 8 > declared_len {
+            return Err(invalid(raw));
+        }
+
+        let fourcc = &raw[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            raw[offset + 4],
+            raw[offset + 5],
+            raw[offset + 6],
+            raw[offset + 7],
+        ]) as usize;
+        let data_start = offset + 8;
+        let data_end = data_start
+            .checked_add(chunk_size)
+            .ok_or_else(|| invalid(raw))?;
+        if data_end > declared_len {
+            return Err(invalid(raw));
+        }
+
+        if matches!(fourcc, b"VP8 " | b"VP8L" | b"VP8X") && chunk_size > 0 {
+            has_image_chunk = true;
+        }
+
+        offset = data_end + (chunk_size % 2);
+        if offset > declared_len {
+            return Err(invalid(raw));
+        }
+    }
+
+    if has_image_chunk {
+        Ok(())
+    } else {
+        Err(invalid(raw))
+    }
 }
 
 /// Download an image from a URL, resize/compress it, and return as a ContentBlock.
@@ -610,6 +668,12 @@ mod tests {
         ]
     }
 
+    fn make_structural_webp_with_vp8_chunk() -> Vec<u8> {
+        let bytes = b"RIFF\x0e\x00\x00\x00WEBPVP8 \x02\x00\x00\x00\x00\x00".to_vec();
+        assert_eq!(bytes.len(), 22);
+        bytes
+    }
+
     #[test]
     fn large_image_resized_to_max_dimension() {
         let png = make_png(3000, 2000);
@@ -826,6 +890,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_webp_header_without_image_chunk() {
+        let stub = b"RIFF\x00\x00\x00\x00WEBP";
+        let result = validate_image_response(Some("image/webp"), stub);
+        assert!(
+            matches!(result, Err(MediaFetchError::InvalidImageBody { .. })),
+            "RIFF/WEBP magic alone is not enough validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_webp_with_truncated_declared_chunk() {
+        let truncated = b"RIFF\x10\x00\x00\x00WEBPVP8 \x08\x00\x00\x00\x00";
+        let result = validate_image_response(Some("image/webp"), truncated);
+        assert!(
+            matches!(result, Err(MediaFetchError::InvalidImageBody { .. })),
+            "declared WebP chunk sizes must fit inside the response body"
+        );
+    }
+
+    #[test]
     fn media_fetch_error_display_renders() {
         let _ = MediaFetchError::NotAnImage.to_string();
         let _ = MediaFetchError::UnsupportedResponseType {
@@ -875,7 +959,8 @@ mod tests {
 
     #[test]
     fn format_failed_attachment_note_multiple() {
-        let note = super::format_failed_attachment_note(&["a.png".to_string(), "b.jpg".to_string()]);
+        let note =
+            super::format_failed_attachment_note(&["a.png".to_string(), "b.jpg".to_string()]);
         assert!(note.contains("`a.png`"));
         assert!(note.contains("`b.jpg`"));
         assert!(note.contains(", "));
@@ -897,16 +982,12 @@ mod tests {
 
     // --- encode_validated_image: resize-fallback threshold tests ---
 
-    /// Minimal WebP header stub: RIFF magic + WEBP FourCC.
-    /// `validate_image_response` accepts it (format detected as WebP);
-    /// `resize_and_compress`'s `decode()` fails because there are no VP8 chunks.
-    fn make_webp_stub() -> Vec<u8> {
-        b"RIFF\x00\x00\x00\x00WEBP".to_vec()
-    }
-
+    /// Structurally complete WebP container with intentionally invalid VP8 data.
+    /// `validate_image_response` accepts the complete container; `resize_and_compress`
+    /// fails when decoding the VP8 payload.
     #[test]
     fn resize_fail_under_1mb_falls_back_to_original_bytes() {
-        let bytes = make_webp_stub(); // 12 bytes << 1 MB
+        let bytes = make_structural_webp_with_vp8_chunk(); // << 1 MB
         let result = encode_validated_image(&bytes, "image/webp", "test.webp");
         let block = result.expect("should fall back to original bytes, not error");
         match block {
@@ -922,7 +1003,7 @@ mod tests {
 
     #[test]
     fn resize_fail_over_1mb_returns_processing_failed() {
-        let mut bytes = make_webp_stub();
+        let mut bytes = make_structural_webp_with_vp8_chunk();
         // Pad to just over 1 MB so the >1 MB branch fires.
         bytes.resize(1024 * 1024 + 1, 0x00);
         let result = encode_validated_image(&bytes, "image/webp", "big.webp");
@@ -936,7 +1017,7 @@ mod tests {
     fn resize_fail_non_webp_always_returns_processing_failed() {
         // A non-WebP file with decode failure must always return ProcessingFailed,
         // even if small — the animated-WebP fallback must not fire for other formats.
-        let bytes = make_webp_stub(); // 12 bytes — well under 1 MB
+        let bytes = make_structural_webp_with_vp8_chunk(); // well under 1 MB
         let result = encode_validated_image(&bytes, "image/png", "corrupt.png");
         assert!(
             matches!(result, Err(MediaFetchError::ProcessingFailed(_))),
@@ -954,7 +1035,10 @@ mod tests {
 
     #[test]
     fn failed_attachment_entry_size_exceeded_notifies_user() {
-        let e = MediaFetchError::SizeExceeded { actual: 20_000_000, limit: 10_000_000 };
+        let e = MediaFetchError::SizeExceeded {
+            actual: 20_000_000,
+            limit: 10_000_000,
+        };
         let entry = failed_attachment_entry("big.png", &e).unwrap();
         assert_eq!(entry, "big.png");
     }
