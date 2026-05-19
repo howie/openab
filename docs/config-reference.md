@@ -179,6 +179,7 @@ Emoji reaction feedback on messages to show agent processing status.
 | `enabled` | bool | `true` | Enable/disable reaction feedback. |
 | `remove_after_reply` | bool | `false` | Remove the status reaction after the agent replies. |
 | `tool_display` | string | `"full"` | How tool calls are rendered: `"full"` (complete title), `"compact"` (count summary, e.g. `✅ 3 · 🔧 1 tool(s)`), or `"none"` (hidden). |
+| `empty_reply_placeholder` | bool | `true` | Post `_(no response)_` for empty successful replies. Set to `false` to suppress empty replies silently. |
 
 ### `[reactions.emojis]`
 
@@ -331,6 +332,7 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
+| `agents.<name>.reactions.emptyReplyPlaceholder` | `[reactions] empty_reply_placeholder` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |
 | `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
 | `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |

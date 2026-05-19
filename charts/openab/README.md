@@ -39,6 +39,7 @@ Each agent lives under `agents.<name>`.
 | `reactions.enabled` | Enable status reactions. | `true` |
 | `reactions.removeAfterReply` | Remove status reactions after the agent replies. | `false` |
 | `reactions.toolDisplay` | Tool display verbosity: `full`, `compact`, or `none`. | `"full"` |
+| `reactions.emptyReplyPlaceholder` | Post `_(no response)_` for empty successful replies. Set to `false` to suppress them. | `true` |
 | `stt.enabled` | Enable voice-message speech-to-text. | `false` |
 | `stt.apiKey` | API key for the speech-to-text provider. | `""` |
 | `stt.model` | STT model name. | `"whisper-large-v3-turbo"` |

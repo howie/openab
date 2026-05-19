@@ -39,7 +39,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -595,7 +600,7 @@ impl AdapterRouter {
                                     // placeholder should stay as "…" until delete fires,
                                     // not flash the literal sentinel text to users.
                                     if let Some(tx) = &buf_tx {
-                                        if text_buf.trim() != "<silent />" {
+                                        if !is_pending_silent_sentinel(&text_buf) {
                                             let _ = tx.send(format!(
                                                 "{reset_prelude}{}",
                                                 compose_display(
@@ -686,7 +691,7 @@ impl AdapterRouter {
                     let text_buf = stripped_text;
 
                     // Sentinel: checked post-loop — chunks may transiently match mid-stream.
-                    if text_buf.trim() == "<silent />" {
+                    if text_buf.trim() == SILENT_SENTINEL {
                         info!(platform = %adapter.platform(), "agent emitted <silent /> sentinel -- suppressing reply");
                         reactions.suppress().await;
                         if let Some(msg) = placeholder_msg {
@@ -837,6 +842,12 @@ impl ToolEntry {
 /// Maximum number of finished tool entries to show individually
 /// during streaming before collapsing into a summary line.
 const TOOL_COLLAPSE_THRESHOLD: usize = 3;
+const SILENT_SENTINEL: &str = "<silent />";
+
+fn is_pending_silent_sentinel(text: &str) -> bool {
+    let text = text.trim();
+    text.is_empty() || SILENT_SENTINEL.starts_with(text)
+}
 
 fn compose_display(
     tool_lines: &[ToolEntry],
@@ -1041,6 +1052,26 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    #[test]
+    fn pending_silent_sentinel_matches_empty_and_prefixes() {
+        for input in ["", " ", "<", "<sil", "<silent /", " <silent /> "] {
+            assert!(
+                is_pending_silent_sentinel(input),
+                "expected {input:?} to be treated as pending sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_silent_sentinel_rejects_diverged_text() {
+        for input in ["hello", "<silent nope", "<silent /> extra", "x<silent />"] {
+            assert!(
+                !is_pending_silent_sentinel(input),
+                "expected {input:?} to stream normally"
+            );
+        }
     }
 
     fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {

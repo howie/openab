@@ -1,0 +1,17 @@
+suite: emptyReplyPlaceholder
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: renders empty_reply_placeholder = false
+    set:
+      agents.kiro.reactions.emptyReplyPlaceholder: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'empty_reply_placeholder = false'
+
+  - it: defaults empty_reply_placeholder to true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'empty_reply_placeholder = true'
