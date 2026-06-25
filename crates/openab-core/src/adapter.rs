@@ -812,8 +812,21 @@ impl AdapterRouter {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
-                                // Reader saw EOF and already drained pending; nothing to abandon.
-                                None => break,
+                                // Reader saw EOF: the agent's stdout closed before it sent
+                                // a final response. For ACP-native agents this is normal
+                                // completion (the final response already broke the loop above),
+                                // but bridged agents that crash on a backend error (e.g. HTTP
+                                // 500 / quota exhausted) exit without ever emitting an ACP error
+                                // notification — leaving response_error None. Surface that as an
+                                // explicit error instead of falling through to "_(no response)_".
+                                // The text_buf guard preserves any partial text already streamed.
+                                None => {
+                                    if response_error.is_none() && text_buf.is_empty() {
+                                        response_error =
+                                            Some("Agent process exited unexpectedly".into());
+                                    }
+                                    break;
+                                }
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
