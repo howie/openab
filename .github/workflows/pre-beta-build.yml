@@ -1,6 +1,8 @@
 name: Pre-Beta Build
 
 on:
+  schedule:
+    - cron: '0 * * * *'      # hourly; gate job skips the build if no commit in the last ~70min
   workflow_dispatch:
     inputs:
       agents:
@@ -15,7 +17,41 @@ env:
   ALL_AGENTS: 'kiro,claude,codex,copilot,cursor,gemini,grok,hermes,mimocode,opencode,antigravity,pi,native,agentcore'
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Skip scheduled run when no recent commits
+        uses: actions/github-script@v7
+        id: check
+        with:
+          script: |
+            // Manual runs always build.
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('should_run', 'true');
+              return;
+            }
+            // Scheduled run: build only if main got a commit in the last ~70min.
+            // 70 (not 60) absorbs GitHub's cron scheduling drift so a commit just
+            // before the hour isn't missed when the run fires a few minutes late.
+            const since = new Date(Date.now() - 70 * 60 * 1000).toISOString();
+            const { data: commits } = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.repository?.default_branch || 'main',
+              since,
+              per_page: 1,
+            });
+            const run = commits.length > 0;
+            core.info(`commits since ${since}: ${commits.length} -> should_run=${run}`);
+            core.setOutput('should_run', run ? 'true' : 'false');
+
   matrix:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     outputs:
       agents: ${{ steps.resolve.outputs.agents }}

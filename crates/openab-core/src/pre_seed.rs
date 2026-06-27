@@ -172,7 +172,8 @@ fn extract_and_apply(
     target: &Path,
     deadline: Instant,
 ) -> anyhow::Result<()> {
-    let temp_dir = tempfile::tempdir_in(target.parent().unwrap_or(target))?;
+    std::fs::create_dir_all(target)?;
+    let temp_dir = tempfile::tempdir_in(target)?;
 
     if data.starts_with(&[0x1f, 0x8b]) {
         extract_tarball_with_limits(data, temp_dir.path(), deadline)?;
@@ -222,7 +223,7 @@ fn extract_zip_budgeted(
 
     for i in 0..file_count {
         // Cooperative deadline check per file
-        if i % 100 == 0 && Instant::now() >= deadline {
+        if i.is_multiple_of(100) && Instant::now() >= deadline {
             anyhow::bail!("hooks.pre_seed: timed out during extraction at entry {i}");
         }
 
@@ -255,6 +256,7 @@ fn extract_zip_budgeted(
             {
                 use std::os::unix::fs::PermissionsExt;
                 if let Some(mode) = file.unix_mode() {
+                    let mode = mode & 0o0777; // strip suid/sgid/sticky
                     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
                 }
             }
@@ -286,7 +288,7 @@ fn extract_tarball_with_limits(data: &[u8], dest: &Path, deadline: Instant) -> a
         }
 
         // Cooperative deadline check every 10 files
-        if file_count % 10 == 0 && Instant::now() >= deadline {
+        if file_count.is_multiple_of(10) && Instant::now() >= deadline {
             anyhow::bail!("hooks.pre_seed: timed out during tarball extraction at entry {file_count}");
         }
 
@@ -300,13 +302,34 @@ fn extract_tarball_with_limits(data: &[u8], dest: &Path, deadline: Instant) -> a
 
         entry.unpack_in(dest)?;
 
+        // Skip symlinks with escaping targets created by unpack_in
+        #[cfg(unix)]
+        if let Ok(path) = entry.path() {
+            let out_path = dest.join(&*path);
+            if out_path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+                if let Ok(target) = std::fs::read_link(&out_path) {
+                    if target.is_absolute()
+                        || target
+                            .components()
+                            .any(|c| c == std::path::Component::ParentDir)
+                    {
+                        let _ = std::fs::remove_file(&out_path);
+                        warn!(
+                            "hooks.pre_seed: removed symlink with escaping target: {}",
+                            target.display()
+                        );
+                    }
+                }
+            }
+        }
+
         // Manually set permissions (strip suid/sgid/sticky, like zip path)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(path) = entry.path() {
                 let out_path = dest.join(path);
-                if out_path.is_file() {
+                if out_path.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false) {
                     let mode = entry.header().mode().unwrap_or(0o644) & 0o0777;
                     let _ = std::fs::set_permissions(
                         &out_path,
@@ -317,6 +340,40 @@ fn extract_tarball_with_limits(data: &[u8], dest: &Path, deadline: Instant) -> a
         }
     }
 
+    Ok(())
+}
+
+/// Create a symlink on Unix, or copy the resolved target on other platforms.
+/// Rejects symlink targets that escape via absolute path or `..` components.
+#[allow(unused_variables)]
+fn create_symlink_or_copy(link_target: &Path, dst: &Path, src: &Path) -> anyhow::Result<()> {
+    // Reject symlinks that could escape the target directory
+    if link_target.is_absolute()
+        || link_target
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!(
+            "hooks.pre_seed: rejecting symlink with escaping target: {}",
+            link_target.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(link_target, dst)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let resolved = src.parent().unwrap_or(Path::new(".")).join(link_target);
+        if resolved.exists() {
+            std::fs::copy(&resolved, dst)?;
+        } else {
+            anyhow::bail!(
+                "hooks.pre_seed: symlink target does not exist: {}",
+                resolved.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -332,7 +389,20 @@ fn move_recursive(src: &Path, dst: &Path, deadline: Instant) -> anyhow::Result<(
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        let meta = src_path.symlink_metadata()?;
+        if meta.is_symlink() {
+            // Preserve symlinks as-is without following
+            let link_target = std::fs::read_link(&src_path)?;
+            // Remove existing dst (file or directory) before creating symlink
+            if let Ok(dst_meta) = dst_path.symlink_metadata() {
+                if dst_meta.is_dir() {
+                    std::fs::remove_dir_all(&dst_path)?;
+                } else {
+                    std::fs::remove_file(&dst_path)?;
+                }
+            }
+            create_symlink_or_copy(&link_target, &dst_path, &src_path)?;
+        } else if meta.is_dir() {
             std::fs::create_dir_all(&dst_path)?;
             move_recursive(&src_path, &dst_path, deadline)?;
         } else {
@@ -650,5 +720,108 @@ mod tests {
         let result = extract_tarball_with_limits(&tarball_bytes, dir.path(), expired);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_recursive_preserves_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        // Create a regular file and a symlink pointing to it
+        std::fs::write(src.path().join("real.txt"), "content").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.path().join("link.txt")).unwrap();
+
+        move_recursive(src.path(), dst.path(), deadline).unwrap();
+
+        let dst_link = dst.path().join("link.txt");
+        let meta = dst_link.symlink_metadata().unwrap();
+        assert!(meta.is_symlink(), "destination should be a symlink");
+        assert_eq!(std::fs::read_link(&dst_link).unwrap().to_str().unwrap(), "real.txt");
+        assert_eq!(std::fs::read_to_string(dst.path().join("real.txt")).unwrap(), "content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_recursive_symlink_overwrites_existing_dir() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+        // src has a symlink named "item"
+        std::fs::write(src.path().join("target.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("target.txt", src.path().join("item")).unwrap();
+
+        // dst has a directory named "item"
+        std::fs::create_dir(dst.path().join("item")).unwrap();
+
+        move_recursive(src.path(), dst.path(), deadline).unwrap();
+
+        let dst_item = dst.path().join("item");
+        let meta = dst_item.symlink_metadata().unwrap();
+        assert!(meta.is_symlink(), "should have replaced directory with symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_and_apply_succeeds_with_non_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+
+        // Regression test: target is writable but target.parent() is read-only.
+        // Old code used tempdir_in(target.parent()) which would fail here.
+        // New code uses tempdir_in(target) which succeeds.
+        let base = tempfile::tempdir().unwrap();
+        let restricted = base.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+
+        // Create target directory (writable)
+        let target = restricted.join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        // Lock down parent so tempdir_in(parent) would fail
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("test.txt", options).unwrap();
+        writer.write_all(b"data").unwrap();
+        let cursor = writer.finish().unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let result = extract_and_apply(cursor.get_ref(), &target, deadline);
+
+        // Restore permissions before asserting (for cleanup)
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Should succeed because tempdir_in(target) works even with read-only parent
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("test.txt")).unwrap(), "data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_and_apply_succeeds_with_writable_target() {
+        use std::io::Write;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("deep").join("target");
+        // target doesn't exist yet — create_dir_all should handle it
+
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("test.txt", options).unwrap();
+        writer.write_all(b"hello").unwrap();
+        let cursor = writer.finish().unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        extract_and_apply(cursor.get_ref(), &target, deadline).unwrap();
+
+        assert_eq!(std::fs::read_to_string(target.join("test.txt")).unwrap(), "hello");
     }
 }

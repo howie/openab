@@ -245,7 +245,7 @@ Lifecycle hooks that run at specific points during the container lifecycle. See 
 
 Downloads and extracts archives from S3 before `pre_boot`. Seeds the agent environment with configs, tools, and shared memory without requiring AWS CLI in the image.
 
-> **Feature flag:** requires the `pre-seed` feature (opt-in, not in default). Enable with `--features pre-seed`.
+> `pre-seed` is enabled by default. No feature flag needed.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
