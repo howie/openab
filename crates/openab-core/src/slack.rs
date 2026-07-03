@@ -717,6 +717,28 @@ fn next_backoff(cur: u64) -> u64 {
     (cur * 2).min(MAX_BACKOFF_SECS)
 }
 
+/// Wraps `connect_async` in the reconnect-path timeout. Extracted so the
+/// regression test exercises the exact same code path `run_slack_adapter`
+/// uses, instead of duplicating the timeout expression (#1279).
+async fn connect_with_reconnect_timeout(
+    ws_url: &str,
+) -> std::result::Result<
+    std::result::Result<
+        (
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::Error,
+    >,
+    tokio::time::error::Elapsed,
+> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
+        tokio_tungstenite::connect_async(ws_url),
+    )
+    .await
+}
+
 /// Sleep for `backoff_secs`, honoring shutdown. Returns the next backoff
 /// value, or `None` if a shutdown signal arrived during the sleep (caller
 /// should return immediately). Shared by every retry point in the reconnect
@@ -800,12 +822,7 @@ pub async fn run_slack_adapter(
         };
         info!(url = %ws_url, "connecting to Slack Socket Mode");
 
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        {
+        match connect_with_reconnect_timeout(&ws_url).await {
             Ok(Ok((ws_stream, _))) => {
                 info!("Slack Socket Mode connected");
                 backoff_secs = 1; // reset on success
@@ -2370,7 +2387,10 @@ mod tests {
 
 #[cfg(test)]
 mod socket_keepalive_tests {
-    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS, RECONNECT_TIMEOUT_SECS};
+    use super::{
+        connect_with_reconnect_timeout, next_backoff, socket_idle, wait_backoff_or_shutdown,
+        IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
+    };
     use std::time::Duration;
 
     /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
@@ -2401,8 +2421,11 @@ mod socket_keepalive_tests {
 
     /// Regression test for #1279: a stalled WebSocket handshake during reconnect
     /// must surface as a timeout instead of parking the reconnect task forever.
-    /// `start_paused` lets the 30s timeout resolve instantly under Tokio's
-    /// virtual clock instead of a real wall-clock wait.
+    /// Calls `connect_with_reconnect_timeout` directly (the same helper
+    /// `run_slack_adapter` calls) so this pins the actual production code
+    /// path, not just a copy of the timeout expression. `start_paused` lets
+    /// the 30s timeout resolve instantly under Tokio's virtual clock instead
+    /// of a real wall-clock wait.
     #[tokio::test(start_paused = true)]
     async fn connect_async_timeout_fires_on_stalled_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2419,15 +2442,32 @@ mod socket_keepalive_tests {
         });
 
         let ws_url = format!("ws://{addr}");
-        let result = tokio::time::timeout(
-            Duration::from_secs(RECONNECT_TIMEOUT_SECS),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await;
+        let result = connect_with_reconnect_timeout(&ws_url).await;
 
         assert!(
             result.is_err(),
             "connect_async on a stalled handshake must time out, not hang"
         );
+    }
+
+    /// With no shutdown signal, `wait_backoff_or_shutdown` sleeps out the
+    /// backoff and returns the next (doubled) value. `start_paused` resolves
+    /// the sleep instantly under Tokio's virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_next_backoff_when_no_shutdown() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let result = wait_backoff_or_shutdown(2, &mut rx).await;
+        assert_eq!(result, Some(next_backoff(2)));
+    }
+
+    /// A shutdown signal wins the race against an arbitrarily long backoff,
+    /// returning `None` so the caller returns immediately instead of parking
+    /// until the backoff elapses.
+    #[tokio::test(start_paused = true)]
+    async fn wait_backoff_or_shutdown_returns_none_on_shutdown() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("receiver still open");
+        let result = wait_backoff_or_shutdown(3600, &mut rx).await;
+        assert_eq!(result, None);
     }
 }
