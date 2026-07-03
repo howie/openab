@@ -699,14 +699,36 @@ const MAX_CONSECUTIVE_BOT_TURNS: usize = 1000;
 const PING_INTERVAL_SECS: u64 = 30;
 const IDLE_TIMEOUT_SECS: u64 = 75;
 const MAX_BACKOFF_SECS: u64 = 30;
-/// Bounds `get_socket_mode_url` and `connect_async` in the reconnect path so a
-/// stalled TCP/TLS handshake surfaces as a retry instead of parking the
-/// reconnect task forever with no logs (see #1279).
+/// Bounds `connect_async` (the WebSocket handshake) in the reconnect path.
+/// `tokio_tungstenite` carries no timeout of its own, so this is the sole
+/// bound against a stalled TLS/WS handshake parking the reconnect task
+/// forever with no logs (see #1279).
 const RECONNECT_TIMEOUT_SECS: u64 = 30;
+/// Bounds `get_socket_mode_url` (the `apps.connections.open` Web API call) in
+/// the reconnect path. Set strictly above the adapter client's own 30s
+/// timeout (see `SlackAdapter::new`) so that timeout — which carries a
+/// diagnosable cause — fires first in the normal case; this constant is a
+/// backstop for the rare case the client builder failed and fell back to an
+/// unbounded `reqwest::Client::new()` (see #1279).
+const RECONNECT_HTTP_TIMEOUT_SECS: u64 = 35;
 
 /// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
 fn next_backoff(cur: u64) -> u64 {
     (cur * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// Sleep for `backoff_secs`, honoring shutdown. Returns the next backoff
+/// value, or `None` if a shutdown signal arrived during the sleep (caller
+/// should return immediately). Shared by every retry point in the reconnect
+/// loop so backoff/shutdown handling only needs to change in one place.
+async fn wait_backoff_or_shutdown(
+    backoff_secs: u64,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<u64> {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => Some(next_backoff(backoff_secs)),
+        _ = shutdown_rx.changed() => None,
+    }
 }
 
 /// The socket is considered dead (half-open) when no inbound frame has arrived
@@ -749,7 +771,7 @@ pub async fn run_slack_adapter(
         }
 
         let ws_url = match tokio::time::timeout(
-            std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
+            std::time::Duration::from_secs(RECONNECT_HTTP_TIMEOUT_SECS),
             get_socket_mode_url(&adapter.client, &app_token),
         )
         .await
@@ -757,24 +779,22 @@ pub async fn run_slack_adapter(
             Ok(Ok(url)) => url,
             Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    _ = shutdown_rx.changed() => { return Ok(()); }
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
                 }
-                backoff_secs = next_backoff(backoff_secs);
                 continue;
             }
             Err(_) => {
                 error!(
                     backoff = backoff_secs,
-                    timeout = RECONNECT_TIMEOUT_SECS,
+                    timeout = RECONNECT_HTTP_TIMEOUT_SECS,
                     "get Socket Mode URL timed out, retrying"
                 );
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    _ = shutdown_rx.changed() => { return Ok(()); }
+                match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+                    Some(next) => backoff_secs = next,
+                    None => return Ok(()),
                 }
-                backoff_secs = next_backoff(backoff_secs);
                 continue;
             }
         };
@@ -1187,18 +1207,19 @@ pub async fn run_slack_adapter(
         }
 
         warn!(backoff = backoff_secs, "reconnecting to Slack Socket Mode");
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-            _ = shutdown_rx.changed() => { return Ok(()); }
+        match wait_backoff_or_shutdown(backoff_secs, &mut shutdown_rx).await {
+            Some(next) => backoff_secs = next,
+            None => return Ok(()),
         }
-        backoff_secs = next_backoff(backoff_secs);
     }
 }
 
 /// Call apps.connections.open to get a WebSocket URL for Socket Mode.
-/// Reuses the adapter's `reqwest::Client` (already bounded by a 30s timeout,
-/// see `SlackAdapter::new`) instead of building a fresh unbounded one per call
-/// (#386), and relies on that timeout to bound the reconnect path (#1279).
+/// Reuses the adapter's `reqwest::Client` instead of building a fresh
+/// unbounded one per call (#386). The reconnect path is bounded by the
+/// caller's explicit `tokio::time::timeout(RECONNECT_HTTP_TIMEOUT_SECS, ...)`
+/// (see #1279); the client's own 30s timeout (see `SlackAdapter::new`) is a
+/// secondary bound that fires first in the normal case, since it's shorter.
 async fn get_socket_mode_url(client: &reqwest::Client, app_token: &str) -> Result<String> {
     let resp = client
         .post(format!("{SLACK_API}/apps.connections.open"))
@@ -2349,7 +2370,7 @@ mod tests {
 
 #[cfg(test)]
 mod socket_keepalive_tests {
-    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS};
+    use super::{next_backoff, socket_idle, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS, RECONNECT_TIMEOUT_SECS};
     use std::time::Duration;
 
     /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
@@ -2376,5 +2397,37 @@ mod socket_keepalive_tests {
         assert!(!socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS - 1), timeout));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS), timeout));
         assert!(socket_idle(Duration::from_secs(IDLE_TIMEOUT_SECS + 10), timeout));
+    }
+
+    /// Regression test for #1279: a stalled WebSocket handshake during reconnect
+    /// must surface as a timeout instead of parking the reconnect task forever.
+    /// `start_paused` lets the 30s timeout resolve instantly under Tokio's
+    /// virtual clock instead of a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn connect_async_timeout_fires_on_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Accept the TCP connection but never send any WS handshake bytes, so
+        // `connect_async` blocks forever waiting for the server's HTTP
+        // upgrade response — the exact stall this timeout is meant to catch.
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let ws_url = format!("ws://{addr}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(RECONNECT_TIMEOUT_SECS),
+            tokio_tungstenite::connect_async(&ws_url),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "connect_async on a stalled handshake must time out, not hang"
+        );
     }
 }
