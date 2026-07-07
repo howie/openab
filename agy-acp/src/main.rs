@@ -33,10 +33,11 @@ impl Adapter {
     ) -> PromptOutput {
         // Snapshot agy's existing cli-*.log sizes before spawning so that, if the
         // turn produces no output, we can attribute only bytes written *during*
-        // this turn (and any swallowed backend error they record) to it, without
-        // picking up a stale error from an earlier turn or a concurrent session.
-        // See `detect_swallowed_agy_error`.
+        // this turn (and any swallowed backend error they record) to it, narrowing
+        // (but not fully eliminating) the risk of picking up a stale error from an
+        // earlier turn or a concurrent session. See `detect_swallowed_agy_error`.
         let log_pre_snapshot = snapshot_agy_logs(&conversations_dir);
+        let spawn_time = std::time::SystemTime::now();
 
         let spawn_result = Command::new(Adapter::agy_bin())
             .args(&args)
@@ -150,32 +151,27 @@ impl Adapter {
                 if !stderr_text.is_empty() { eprintln!("[agy-acp] agy stderr: {}", stderr_text.trim_end()); }
                 if !was_cancelled && !status.success() {
                     eprintln!("[agy-acp] WARN: agy exited with status: {}", status);
-                    if !had_updates {
-                        let msg = if stderr_text.is_empty() { format!("agy exited with status: {}", status) }
-                            else { format!("agy failed: {}", stderr_text.trim_end()) };
-                        return PromptOutput {
-                            response_lines: vec![serde_json::to_string(&JsonRpcResponse {
-                                jsonrpc: "2.0", id, result: None, error: Some(json!({"code":-32000,"message":msg})),
-                            }).unwrap()],
-                            session_update,
-                        };
-                    }
-                } else if !was_cancelled && !had_updates {
-                    // agy exited 0 but streamed nothing this turn. `agy --print`
-                    // swallows backend failures (e.g. quota 429 / RESOURCE_EXHAUSTED)
-                    // with a 0 exit code and empty stdout/stderr, recording the cause
-                    // only in its own cli.log. An empty successful turn is therefore
-                    // almost always a hidden error; surface it as a JSON-RPC error
-                    // (mirroring claude-agent-acp) instead of a blank "(no response)".
-                    if let Some(details) = detect_swallowed_agy_error(&conversations_dir, &log_pre_snapshot) {
-                        eprintln!("[agy-acp] surfacing swallowed agy error: {}", details);
-                        return PromptOutput {
-                            response_lines: vec![serde_json::to_string(&JsonRpcResponse {
-                                jsonrpc: "2.0", id, result: None, error: Some(json!({"code":-32603,"message":details})),
-                            }).unwrap()],
-                            session_update,
-                        };
-                    }
+                }
+                // agy --print swallows backend failures (e.g. quota 429 /
+                // RESOURCE_EXHAUSTED) with a 0 exit code and empty stdout/stderr,
+                // recording the cause only in its own cli.log; an empty successful
+                // turn is therefore almost always a hidden error. See
+                // `decide_turn_error` for the full decision logic.
+                let swallowed_error = if !was_cancelled && status.success() && !had_updates {
+                    detect_swallowed_agy_error(&conversations_dir, &log_pre_snapshot, spawn_time)
+                } else {
+                    None
+                };
+                if let Some((code, msg)) = decide_turn_error(
+                    was_cancelled, status.success(), had_updates, &status.to_string(), &stderr_text, swallowed_error.as_deref(),
+                ) {
+                    eprintln!("[agy-acp] surfacing turn error ({code}): {msg}");
+                    return PromptOutput {
+                        response_lines: vec![serde_json::to_string(&JsonRpcResponse {
+                            jsonrpc: "2.0", id, result: None, error: Some(json!({"code":code,"message":msg})),
+                        }).unwrap()],
+                        session_update,
+                    };
                 }
             }
             Err(e) => {
@@ -198,26 +194,75 @@ impl Adapter {
     }
 }
 
+/// Decide whether this turn's outcome should be surfaced as a JSON-RPC error
+/// instead of falling through to the normal `end_turn`/`error` `stopReason`
+/// result. `status_display` is the exit status already formatted as a string
+/// (e.g. `status.to_string()`); `swallowed_error` is the result of
+/// `detect_swallowed_agy_error` for the zero-exit-but-empty-output case.
+/// Returns `Some((code, message))` when an error should be surfaced.
+fn decide_turn_error(
+    was_cancelled: bool,
+    status_success: bool,
+    had_updates: bool,
+    status_display: &str,
+    stderr_text: &str,
+    swallowed_error: Option<&str>,
+) -> Option<(i32, String)> {
+    if was_cancelled || had_updates {
+        return None;
+    }
+    if !status_success {
+        let msg = if stderr_text.is_empty() {
+            format!("agy exited with status: {status_display}")
+        } else {
+            format!("agy failed: {}", stderr_text.trim_end())
+        };
+        return Some((-32000, msg));
+    }
+    swallowed_error.map(|details| (-32603, details.to_string()))
+}
+
+/// Match predicate for agy's `cli-*.log` files, shared by `snapshot_agy_logs` and
+/// `detect_swallowed_agy_error` so the naming convention lives in one place.
+fn is_agy_cli_log(name: &str) -> bool {
+    name.starts_with("cli-") && name.ends_with(".log")
+}
+
 /// Snapshot agy's current `cli-*.log` files as `name -> byte length` under
 /// `<conversations_dir>/../log`. Recording each file's pre-turn size (not just
 /// its name) lets `detect_swallowed_agy_error` scan only the bytes appended
-/// *during* this turn, so it never surfaces a stale error from an earlier turn
-/// or from a concurrent session that shares this log directory.
+/// *during* this turn. This narrows, but does not fully eliminate, the risk of
+/// attributing another turn's or a concurrent session's error to this turn —
+/// see `detect_swallowed_agy_error`'s doc for the residual limitation.
 fn snapshot_agy_logs(conversations_dir: &std::path::Path) -> HashMap<String, u64> {
     let Some(log_dir) = conversations_dir.parent().map(|p| p.join("log")) else {
         return HashMap::new();
     };
-    let Ok(entries) = std::fs::read_dir(&log_dir) else {
-        return HashMap::new();
+    let entries = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            eprintln!(
+                "[agy-acp] cannot read agy log dir {}: {e}; swallowed-error detection disabled this turn",
+                log_dir.display()
+            );
+            return HashMap::new();
+        }
     };
     entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            if !name.starts_with("cli-") || !name.ends_with(".log") {
+            if !is_agy_cli_log(&name) {
                 return None;
             }
-            Some((name, e.metadata().ok()?.len()))
+            match e.metadata() {
+                Ok(meta) => Some((name, meta.len())),
+                Err(e) => {
+                    eprintln!("[agy-acp] cannot stat agy log {name}: {e}; it will be treated as new next turn");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -231,26 +276,44 @@ const MAX_LOG_SCAN_BYTES: u64 = 256 * 1024;
 /// Scan the `cli-*.log` files agy appended to during this turn for a backend
 /// error it swallowed. `agy --print` exits 0 with empty stdout/stderr when the
 /// model backend fails (e.g. quota 429 / RESOURCE_EXHAUSTED), recording the
-/// cause only in its own cli.log. Only bytes written after each file's
-/// `pre_snapshot` size are considered, so a stale error from an earlier turn or
-/// a concurrent session is never attributed to this turn. Returns a cleaned,
-/// human-readable message when a known signature is found.
+/// cause only in its own cli.log. A candidate must have grown past its
+/// `pre_snapshot` size *and* been modified at or after `spawn_time` (when this
+/// turn's own agy child was spawned).
+///
+/// This narrows the window for a *reused* log file (bytes written before this
+/// turn's snapshot are excluded) but does **not** fully isolate a *concurrent*
+/// `agy-acp` session: the log directory is shared by every running session,
+/// and agy's log filenames carry no PID/session correlation we can key on. A
+/// concurrent session's own agy child writing a brand-new log at or after this
+/// turn's `spawn_time` can still be scanned and, if it matches a known anchor,
+/// misattributed to this turn. Fully closing this would require per-invocation
+/// log isolation from agy itself, which is not available (agy is closed-source).
 fn detect_swallowed_agy_error(
     conversations_dir: &std::path::Path,
     pre_snapshot: &HashMap<String, u64>,
+    spawn_time: std::time::SystemTime,
 ) -> Option<String> {
     let log_dir = conversations_dir.parent()?.join("log");
-    let Ok(entries) = std::fs::read_dir(&log_dir) else {
-        return None;
+    let entries = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!(
+                "[agy-acp] cannot read agy log dir {}: {e}; swallowed-error detection skipped this turn",
+                log_dir.display()
+            );
+            return None;
+        }
     };
 
     // Only logs that grew this turn (new file, or larger than the pre-turn
-    // snapshot); `offset` is where this turn's bytes begin.
-    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> = entries
+    // snapshot) and were modified at/after this turn's own agy child was
+    // spawned; `offset` is where this turn's bytes begin, `len` its current size.
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64, u64)> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            if !name.starts_with("cli-") || !name.ends_with(".log") {
+            if !is_agy_cli_log(&name) {
                 return None;
             }
             let meta = e.metadata().ok()?;
@@ -258,31 +321,56 @@ fn detect_swallowed_agy_error(
             if meta.len() <= offset {
                 return None; // nothing appended this turn
             }
-            Some((meta.modified().ok()?, e.path(), offset))
+            let mtime = meta.modified().ok()?;
+            if mtime < spawn_time {
+                return None; // grew before this turn's own agy child was spawned
+            }
+            Some((mtime, e.path(), offset, meta.len()))
         })
         .collect();
 
-    candidates.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime)); // newest first
+    candidates.sort_by_key(|(mtime, _, _, _)| std::cmp::Reverse(*mtime)); // newest first
 
-    candidates
-        .iter()
-        .take(3)
-        .find_map(|(_, path, offset)| read_log_tail(path, *offset).and_then(|c| extract_agy_error_message(&c)))
+    let scanned = candidates.len();
+    let found = candidates.iter().take(3).find_map(|(_, path, offset, len)| {
+        read_log_tail(path, *offset, *len).and_then(|c| extract_agy_error_message(&c))
+    });
+
+    if found.is_none() && scanned > 0 {
+        eprintln!(
+            "[agy-acp] swallowed-error scan: {scanned} log(s) grew this turn but no known error signature matched; treating as a genuinely empty turn"
+        );
+    }
+    found
 }
 
 /// Read the bytes a log accumulated after `offset`, capped at the last
 /// `MAX_LOG_SCAN_BYTES` so an oversized debug log does not force a huge
-/// allocation. Decoded lossily: a byte-range read can split a multi-byte char
-/// at the start boundary, but the error anchors we match are pure ASCII.
-fn read_log_tail(path: &std::path::Path, offset: u64) -> Option<String> {
+/// allocation. `len` is the file's already-known size (from the caller's own
+/// directory scan), avoiding a redundant re-stat. Decoded lossily: a byte-range
+/// read can split a multi-byte char at the start boundary, but the error
+/// anchors we match are pure ASCII.
+fn read_log_tail(path: &std::path::Path, offset: u64, len: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
-    let end = file.metadata().ok()?.len();
-    let start = offset.max(end.saturating_sub(MAX_LOG_SCAN_BYTES));
+    let start = offset.max(len.saturating_sub(MAX_LOG_SCAN_BYTES));
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
     file.take(MAX_LOG_SCAN_BYTES).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Truncate `s` to at most `max` bytes, snapping back to the nearest char
+/// boundary so a multi-byte UTF-8 char is never split (which would panic).
+fn truncate_to_byte_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 /// Extract a clean, single-line error message from agy's cli.log content. agy
@@ -301,13 +389,7 @@ fn extract_agy_error_message(content: &str) -> Option<String> {
             if let Some((first, _)) = msg.split_once(".: ") {
                 msg = format!("{}.", first);
             }
-            if msg.len() > 500 {
-                let mut end = 500;
-                while !msg.is_char_boundary(end) {
-                    end -= 1;
-                }
-                msg.truncate(end);
-            }
+            truncate_to_byte_boundary(&mut msg, 500);
             return Some(msg);
         }
     }
@@ -520,6 +602,22 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    /// RAII guard for a temp-dir test fixture: removes the directory on drop,
+    /// so cleanup still runs if an assertion panics mid-test (a bare
+    /// `fs::remove_dir_all` call after the assertions is skipped by a panic,
+    /// leaking the temp dir).
+    struct TempDirGuard(std::path::PathBuf);
+    impl std::ops::Deref for TempDirGuard {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path { &self.0 }
+    }
+    impl AsRef<std::path::Path> for TempDirGuard {
+        fn as_ref(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
     #[test]
     fn test_extract_text_from_step_payload_field20_field1() {
         let mut inner = Vec::new();
@@ -641,28 +739,27 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
 
     #[test]
     fn test_detect_swallowed_agy_error_reads_new_turn_log() {
-        let root = std::env::temp_dir().join(format!("agy-acp-logscan-{}", Uuid::new_v4()));
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-{}", Uuid::new_v4())));
         let conversations = root.join("conversations");
         let log_dir = root.join("log");
         fs::create_dir_all(&conversations).unwrap();
         fs::create_dir_all(&log_dir).unwrap();
+        let spawn_time = std::time::SystemTime::now();
         fs::write(log_dir.join("cli-20260707_083407.log"), QUOTA_LOG).unwrap();
 
         let empty = HashMap::new();
-        let detected = detect_swallowed_agy_error(&conversations, &empty);
+        let detected = detect_swallowed_agy_error(&conversations, &empty, spawn_time);
         assert!(detected.is_some(), "should detect error in fresh log");
         assert!(detected.unwrap().contains("Individual quota reached"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn test_detect_swallowed_agy_error_none_when_no_logs() {
-        let root = std::env::temp_dir().join(format!("agy-acp-logscan-empty-{}", Uuid::new_v4()));
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-empty-{}", Uuid::new_v4())));
         let conversations = root.join("conversations");
         fs::create_dir_all(&conversations).unwrap();
         let empty = HashMap::new();
-        assert_eq!(detect_swallowed_agy_error(&conversations, &empty), None);
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(detect_swallowed_agy_error(&conversations, &empty, std::time::SystemTime::now()), None);
     }
 
     #[test]
@@ -670,7 +767,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         // A log that already contained an error BEFORE this turn, then had only
         // benign lines appended during the turn, must not be surfaced (F1/F2:
         // stale-error / cross-session isolation).
-        let root = std::env::temp_dir().join(format!("agy-acp-logscan-stale-{}", Uuid::new_v4()));
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-stale-{}", Uuid::new_v4())));
         let conversations = root.join("conversations");
         let log_dir = root.join("log");
         fs::create_dir_all(&conversations).unwrap();
@@ -680,6 +777,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
 
         // Snapshot captures the size *after* the pre-existing error.
         let snapshot = snapshot_agy_logs(&conversations);
+        let spawn_time = std::time::SystemTime::now();
 
         // This turn appends only a benign line.
         let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
@@ -688,18 +786,17 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         drop(f);
 
         assert_eq!(
-            detect_swallowed_agy_error(&conversations, &snapshot),
+            detect_swallowed_agy_error(&conversations, &snapshot, spawn_time),
             None,
             "pre-existing error before the snapshot offset must not be surfaced"
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn test_detect_swallowed_agy_error_reads_only_appended_bytes() {
         // Log started clean; this turn appended the quota error. Snapshot offset
         // skips the clean prefix, and detection surfaces the appended error.
-        let root = std::env::temp_dir().join(format!("agy-acp-logscan-append-{}", Uuid::new_v4()));
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-append-{}", Uuid::new_v4())));
         let conversations = root.join("conversations");
         let log_dir = root.join("log");
         fs::create_dir_all(&conversations).unwrap();
@@ -708,16 +805,129 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         fs::write(&log_path, "I0707 08:00:00.000000  84 server.go:825] Created conversation abc\n").unwrap();
 
         let snapshot = snapshot_agy_logs(&conversations);
+        let spawn_time = std::time::SystemTime::now();
 
         let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
         use std::io::Write as _;
         f.write_all(QUOTA_LOG.as_bytes()).unwrap();
         drop(f);
 
-        let detected = detect_swallowed_agy_error(&conversations, &snapshot);
+        let detected = detect_swallowed_agy_error(&conversations, &snapshot, spawn_time);
         assert!(detected.is_some(), "should detect error appended this turn");
         assert!(detected.unwrap().contains("Individual quota reached"));
-        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_swallowed_agy_error_excludes_log_grown_before_spawn_time() {
+        // Simulates a concurrent/prior agy invocation whose log file was absent
+        // from this turn's pre_snapshot (so offset tracking alone would treat it
+        // as "grew this turn"), but which actually finished growing *before*
+        // this turn's own agy child was spawned. The spawn_time filter must
+        // exclude it even though the offset check alone would not.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-concurrent-{}", Uuid::new_v4())));
+        let conversations = root.join("conversations");
+        let log_dir = root.join("log");
+        fs::create_dir_all(&conversations).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+
+        // Pre-snapshot taken before either log file exists.
+        let empty_snapshot = snapshot_agy_logs(&conversations);
+
+        // A concurrent/earlier session's log, fully written before spawn_time.
+        fs::write(log_dir.join("cli-20260707_083000.log"), QUOTA_LOG).unwrap();
+        let spawn_time = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // This turn's own log, written after spawn_time, contains no error.
+        fs::write(
+            log_dir.join("cli-20260707_083500.log"),
+            "I0707 08:35:00.000000  84 server.go:825] turn ok\n",
+        )
+        .unwrap();
+
+        let detected = detect_swallowed_agy_error(&conversations, &empty_snapshot, spawn_time);
+        assert_eq!(
+            detected, None,
+            "a log that finished growing before this turn's spawn_time must not be surfaced"
+        );
+    }
+
+    #[test]
+    fn test_detect_swallowed_agy_error_scans_beyond_first_candidate() {
+        // 4 logs grow this turn; only the oldest-by-mtime (4th newest) has the
+        // error. `.take(3)` means this is exactly the boundary where it would be
+        // missed if the cap were any smaller — documents current behavior.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-multi-{}", Uuid::new_v4())));
+        let conversations = root.join("conversations");
+        let log_dir = root.join("log");
+        fs::create_dir_all(&conversations).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        let empty = HashMap::new();
+        let spawn_time = std::time::SystemTime::now();
+
+        for (i, name) in ["cli-a.log", "cli-b.log", "cli-c.log"].iter().enumerate() {
+            fs::write(log_dir.join(name), format!("I0707 08:3{i}:00.000000  84 server.go:825] turn ok\n")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(log_dir.join("cli-d.log"), QUOTA_LOG).unwrap();
+
+        let detected = detect_swallowed_agy_error(&conversations, &empty, spawn_time);
+        assert!(detected.is_some(), "error in the 4th grown log should still be found within the take(3)+newest-first scan");
+    }
+
+    #[test]
+    fn test_read_log_tail_respects_offset_and_cap_on_large_file() {
+        // A file larger than MAX_LOG_SCAN_BYTES, with a non-trivial offset placed
+        // after the cap boundary: the read must start at `offset`, not at
+        // `len - MAX_LOG_SCAN_BYTES`, and must not read past `len`.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logtail-{}", Uuid::new_v4())));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("big.log");
+        let prefix = "x".repeat((MAX_LOG_SCAN_BYTES as usize) + 1000);
+        let content = format!("{prefix}{QUOTA_LOG}");
+        fs::write(&path, &content).unwrap();
+        let len = content.len() as u64;
+        let offset = prefix.len() as u64;
+
+        let tail = read_log_tail(&path, offset, len).expect("should read tail");
+        assert!(tail.contains("Individual quota reached"), "should read from offset, not from len - cap");
+        assert!(tail.len() as u64 <= MAX_LOG_SCAN_BYTES, "must not exceed the cap");
+    }
+
+    #[test]
+    fn test_decide_turn_error_cancelled_never_surfaces() {
+        assert_eq!(decide_turn_error(true, false, false, "exit 1", "boom", Some("swallowed")), None);
+    }
+
+    #[test]
+    fn test_decide_turn_error_had_updates_never_surfaces() {
+        assert_eq!(decide_turn_error(false, false, true, "exit 1", "boom", Some("swallowed")), None);
+    }
+
+    #[test]
+    fn test_decide_turn_error_nonzero_exit_uses_stderr() {
+        let (code, msg) = decide_turn_error(false, false, false, "exit status: 1", "boom", None).unwrap();
+        assert_eq!(code, -32000);
+        assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn test_decide_turn_error_nonzero_exit_falls_back_to_status_when_stderr_empty() {
+        let (code, msg) = decide_turn_error(false, false, false, "exit status: 1", "", None).unwrap();
+        assert_eq!(code, -32000);
+        assert!(msg.contains("exit status: 1"));
+    }
+
+    #[test]
+    fn test_decide_turn_error_success_with_swallowed_error_surfaces_32603() {
+        let (code, msg) = decide_turn_error(false, true, false, "exit status: 0", "", Some("quota exhausted")).unwrap();
+        assert_eq!(code, -32603);
+        assert_eq!(msg, "quota exhausted");
+    }
+
+    #[test]
+    fn test_decide_turn_error_success_no_swallowed_error_falls_through() {
+        assert_eq!(decide_turn_error(false, true, false, "exit status: 0", "", None), None);
     }
 
     #[test]
