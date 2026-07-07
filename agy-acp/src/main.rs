@@ -284,10 +284,13 @@ const MAX_LOG_SCAN_BYTES: u64 = 256 * 1024;
 /// error it swallowed. `agy --print` exits 0 with empty stdout/stderr when the
 /// model backend fails (e.g. quota 429 / RESOURCE_EXHAUSTED), recording the
 /// cause only in its own cli.log. A candidate must have grown past its
-/// `pre_snapshot` size *and* been modified at or after `spawn_time` (when this
-/// turn's own agy child was spawned). Every candidate that grew is scanned
-/// (newest first, no arbitrary cap) so a genuinely empty turn's own log is
-/// never skipped in favor of another candidate.
+/// `pre_snapshot` size *and* been modified no more than 1s before `spawn_time`
+/// (when this turn's own agy child was spawned) — the 1s tolerance absorbs
+/// filesystems that truncate mtime to whole seconds, which could otherwise
+/// make this turn's own log look stale by a few hundred ms and be wrongly
+/// excluded. Every candidate that grew is scanned (newest first, no arbitrary
+/// cap) so a genuinely empty turn's own log is never skipped in favor of
+/// another candidate.
 ///
 /// This narrows the window for a *reused* log file (bytes written before this
 /// turn's snapshot are excluded) but does **not** fully isolate a *concurrent*
@@ -346,8 +349,15 @@ fn detect_swallowed_agy_error(
                     return None;
                 }
             };
-            if mtime < spawn_time {
-                return None; // grew before this turn's own agy child was spawned
+            // Tolerate up to 1s of clock/filesystem imprecision: some filesystems
+            // truncate mtime to whole seconds, which can make this turn's own
+            // log (written a few hundred ms after spawn_time) appear to predate
+            // it. A false negative here (excluding this turn's own error) is
+            // worse than the tradeoff of a slightly wider window for the
+            // already-acknowledged concurrent-session risk above, so we only
+            // exclude a candidate that is unambiguously more than 1s stale.
+            if mtime + std::time::Duration::from_secs(1) < spawn_time {
+                return None; // grew well before this turn's own agy child was spawned
             }
             Some((mtime, e.path(), offset, meta.len()))
         })
@@ -905,6 +915,33 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         assert_eq!(
             detected, None,
             "a log that finished growing before this turn's spawn_time must not be surfaced"
+        );
+    }
+
+    #[test]
+    fn test_detect_swallowed_agy_error_tolerates_mtime_just_before_spawn_time() {
+        // This turn's own log can legitimately have an mtime a few hundred ms
+        // *before* spawn_time on filesystems that truncate mtime to whole
+        // seconds. The 1s tolerance must still surface its error rather than
+        // excluding it as if it were a stale/concurrent log.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-tolerance-{}", Uuid::new_v4())));
+        let conversations = root.join("conversations");
+        let log_dir = root.join("log");
+        fs::create_dir_all(&conversations).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        let empty = HashMap::new();
+
+        fs::write(log_dir.join("cli-20260707_083407.log"), QUOTA_LOG).unwrap();
+        // spawn_time captured 300ms after the write completed -- within the 1s
+        // tolerance, simulating a coarse-mtime filesystem rounding the log's
+        // real write instant down to just before spawn_time.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let spawn_time = std::time::SystemTime::now();
+
+        let detected = detect_swallowed_agy_error(&conversations, &empty, spawn_time);
+        assert!(
+            detected.is_some(),
+            "a log within the 1s tolerance window must still be surfaced, not excluded as stale"
         );
     }
 
