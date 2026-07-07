@@ -3,20 +3,49 @@ use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
-    KeyValuePair, NetworkConfiguration, Secret,
+    KeyValuePair, NetworkConfiguration, RuntimePlatform, Secret,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
-/// Try to load bootstrap state for networking defaults (used in future for auto-fill)
-#[allow(dead_code)]
+/// Load bootstrap state to resolve the task execution role ARN (and other
+/// networking defaults). Required on `register_task_definition` whenever the
+/// task uses ECS-injected secrets (or pulls from a private registry) — ECS
+/// rejects the request with "you must also specify a value for
+/// 'executionRoleArn'" otherwise.
 async fn load_bootstrap_state(config: &aws_config::SdkConfig) -> Option<BootstrapState> {
-    let sts = aws_sdk_sts::Client::new(config);
-    let account = sts.get_caller_identity().send().await.ok()?
-        .account()?.to_string();
-    let bucket = format!("oab-control-plane-{account}");
+    let bucket = if let Some(b) = crate::config::OabConfig::load().ok().and_then(|c| c.bucket()) {
+        b
+    } else {
+        let sts = aws_sdk_sts::Client::new(config);
+        let identity = match sts.get_caller_identity().send().await {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("  ⚠ load_bootstrap_state: STS get_caller_identity failed: {e}");
+                return None;
+            }
+        };
+        let account = match identity.account() {
+            Some(a) => a.to_string(),
+            None => {
+                eprintln!("  ⚠ load_bootstrap_state: STS response missing account field");
+                return None;
+            }
+        };
+        format!("oab-control-plane-{account}")
+    };
     let s3 = aws_sdk_s3::Client::new(config);
-    crate::bootstrap::load_state_pub(&s3, &bucket).await.ok().flatten()
+    match crate::bootstrap::load_state_pub(&s3, &bucket).await {
+        Ok(Some(state)) => Some(state),
+        Ok(None) => {
+            eprintln!("  ⚠ load_bootstrap_state: no bootstrap state found in s3://{bucket}/bootstrap-state.json (run `oabctl bootstrap` first)");
+            None
+        }
+        Err(e) => {
+            eprintln!("  ⚠ load_bootstrap_state: failed to read bootstrap state from s3://{bucket}: {e}");
+            None
+        }
+    }
 }
 
 pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_config: bool, wait: bool) -> Result<()> {
@@ -69,7 +98,7 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, sync_confi
     Ok(())
 }
 
-fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
+pub(crate) fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
     let mut manifests = Vec::new();
     if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
@@ -216,30 +245,86 @@ async fn apply_ecs(
         KeyValuePair::builder().name("NAMESPACE").value(&m.metadata.namespace).build(),
         KeyValuePair::builder().name("NAME").value(&m.metadata.name).build(),
     ];
-    if !m.spec.config_from.is_empty() {
-        env_vars.push(KeyValuePair::builder().name("CONFIG_S3_PATH").value(&m.spec.config_from).build());
-    }
+    // openab's own AWS SDK calls (config-s3 loading, secrets resolution, etc.)
+    // resolve region via the standard chain: AWS_REGION env var → profile →
+    // IMDS. Fargate tasks have no EC2 instance metadata to fall back to, so
+    // without this the SDK can fail to resolve an endpoint at all.
+    // Region is injected below after bootstrap_state is loaded (to allow
+    // fallback to bootstrap_state.region when config.region() is None).
     if let Some(ref bootstrap) = m.spec.bootstrap_from {
         env_vars.push(KeyValuePair::builder().name("BOOTSTRAP_FROM").value(bootstrap).build());
     }
 
-    // 3. Build secrets from map
-    let secrets: Vec<Secret> = m
-        .spec
-        .secrets
-        .iter()
-        .map(|(name, ssm_path)| {
-            Secret::builder().name(name).value_from(ssm_path).build().unwrap()
-        })
-        .collect();
+    // 3. Build secrets from map. Values can be either the ECS-native
+    //    `valueFrom` format directly (a Secrets Manager ARN, optionally with
+    //    a `:<jsonKey>::` suffix), or the same `aws-sm://<secret-id>#<json-key>`
+    //    shorthand openab itself uses for in-app secret refs — resolved here
+    //    into the ECS-native form ECS actually requires, since ECS has no
+    //    knowledge of that scheme.
+    let sm = aws_sdk_secretsmanager::Client::new(config);
+    let mut secrets: Vec<Secret> = Vec::with_capacity(m.spec.secrets.len());
+    for (name, value) in &m.spec.secrets {
+        let value_from = crate::secrets::resolve_value_from(&sm, value).await?;
+        secrets.push(Secret::builder().name(name).value_from(value_from).build().unwrap());
+    }
 
-    // 4. Register task definition
+    // 4. Register task definition. Resolve bootstrap state once up front — it
+    // supplies both the CloudWatch log group (for logConfiguration below) and
+    // the execution role ARN (further down), neither of which the manifest
+    // can or should specify directly (bootstrap owns these, not the manifest —
+    // see operator/README.md's "Resources Created" section).
+    let bootstrap_state = load_bootstrap_state(config).await;
+
+    // Resolve effective region: prefer SDK config, fall back to bootstrap
+    // state's recorded region. Fargate has no IMDS, so without AWS_REGION the
+    // container's SDK calls will fail to resolve endpoints entirely.
+    let effective_region: Option<String> = config.region()
+        .map(|r| r.as_ref().to_string())
+        .or_else(|| bootstrap_state.as_ref().map(|s| s.region.clone()));
+    if let Some(ref region) = effective_region {
+        env_vars.push(KeyValuePair::builder().name("AWS_REGION").value(region).build());
+    }
+
     let mut container = ContainerDefinition::builder()
         .name("openab")
         .image(&m.spec.image)
         .essential(true)
         .set_environment(Some(env_vars))
         .set_secrets(if secrets.is_empty() { None } else { Some(secrets) });
+
+    // The image's default CMD points `openab` at a local
+    // /etc/openab/config.toml that nothing populates. openab has native
+    // s3:// config-source support (built with the `config-s3` feature,
+    // included in the default feature set + `unified`), so override the
+    // command to load configFrom directly instead — no download step,
+    // sidecar, or entrypoint script needed. Uses the task role's existing
+    // s3:GetObject grant on `{bucket}/artifacts/*`.
+    if !m.spec.config_from.is_empty() {
+        container = container.set_command(Some(vec![
+            "openab".to_string(),
+            "run".to_string(),
+            "-c".to_string(),
+            m.spec.config_from.clone(),
+        ]));
+    }
+
+    // Ship container stdout/stderr to the log group bootstrap created, so a
+    // crashing/misbehaving container is actually diagnosable. Without this,
+    // ECS uses no log driver and task failures are opaque (no log stream at
+    // all, not even an empty one).
+    if let Some(log_group) = bootstrap_state.as_ref().map(|s| &s.resources.log_group) {
+        if let Some(ref region) = effective_region {
+            container = container.log_configuration(
+                aws_sdk_ecs::types::LogConfiguration::builder()
+                    .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
+                    .options("awslogs-group", log_group.as_str())
+                    .options("awslogs-region", region.as_str())
+                    .options("awslogs-stream-prefix", &service_name)
+                    .options("awslogs-create-group", "true")
+                    .build()?,
+            );
+        }
+    }
 
     // Ingress needs the container port exposed so ECS can register an SRV record
     // (Cloud Map + API Gateway learn the target port from it).
@@ -254,14 +339,61 @@ async fn apply_ecs(
 
     let container = container.build();
 
-    let task_def = ecs
+    // ECS requires executionRoleArn whenever the task definition uses
+    // container secrets (or a private registry) — resolve it from bootstrap
+    // state rather than requiring it in the manifest, matching how the
+    // task role / cluster / subnets are already sourced from bootstrap.
+    //
+    // taskRoleArn is separate and equally required: ECS only provisions the
+    // AWS_CONTAINER_CREDENTIALS_RELATIVE_URI endpoint (and injects that env
+    // var into the container) when a task role is set on the task
+    // definition. Without it, the running `openab` process has no AWS
+    // credentials at all for its own SDK calls (fetching configFrom from S3,
+    // resolving spec.secrets values via aws-sm:// refs, etc.) — it falls
+    // through envvar/profile/webidentity/ECS providers and finally tries
+    // IMDS, which doesn't exist on Fargate, and fails with a generic
+    // "dispatch failure". This was previously never set at all.
+    let execution_role_arn = bootstrap_state.as_ref().map(|s| s.resources.execution_role_arn.clone());
+    let task_role_arn = bootstrap_state.as_ref().map(|s| s.resources.task_role_arn.clone());
+
+    let mut register_req = ecs
         .register_task_definition()
         .family(&service_name)
         .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
         .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
         .cpu(&m.spec.resources.cpu)
         .memory(&m.spec.resources.memory)
-        .container_definitions(container)
+        .container_definitions(container);
+    if let Some(arn) = &execution_role_arn {
+        register_req = register_req.execution_role_arn(arn);
+    } else if !m.spec.secrets.is_empty() {
+        anyhow::bail!(
+            "spec.secrets is set but no bootstrap execution role was found — run `oabctl bootstrap` first, or ECS will reject task registration"
+        );
+    }
+    if let Some(arn) = &task_role_arn {
+        register_req = register_req.task_role_arn(arn);
+    } else {
+        anyhow::bail!(
+            "no bootstrap task role was found — run `oabctl bootstrap` first, or the running container will have no AWS credentials"
+        );
+    }
+
+    // Set runtime platform (OS + CPU architecture) — required for Fargate to
+    // schedule on Graviton (ARM64) vs Intel/AMD (X86_64).
+    let cpu_arch = match ecs_rt.architecture.as_str() {
+        "ARM64" => aws_sdk_ecs::types::CpuArchitecture::Arm64,
+        "X86_64" => aws_sdk_ecs::types::CpuArchitecture::X8664,
+        other => anyhow::bail!("unsupported architecture '{other}' — should be caught by manifest validation"),
+    };
+    register_req = register_req.runtime_platform(
+        RuntimePlatform::builder()
+            .operating_system_family(aws_sdk_ecs::types::OsFamily::Linux)
+            .cpu_architecture(cpu_arch)
+            .build(),
+    );
+
+    let task_def = register_req
         .send()
         .await
         .context("failed to register task definition")?;
@@ -296,7 +428,8 @@ async fn apply_ecs(
     // existing service since March 2022; no delete-and-recreate is needed).
     let cloud_map = if let Some(ingress) = &m.spec.ingress {
         eprintln!("  🌐 Reconciling ingress (Cloud Map)...");
-        Some(crate::ingress::ensure_cloud_map(config, m, ingress).await?)
+        let cm = crate::ingress::ensure_cloud_map(config, m, ingress).await?;
+        Some(cm)
     } else {
         None
     };
@@ -335,6 +468,7 @@ async fn apply_ecs(
             .cluster("oab")
             .service(&service_name)
             .task_definition(&task_def_arn)
+            .enable_execute_command(true)
             .network_configuration(network_config);
 
         if let Some(cm) = &cloud_map {
@@ -389,6 +523,7 @@ async fn apply_ecs(
             .service_name(&service_name)
             .task_definition(&task_def_arn)
             .desired_count(1)
+            .enable_execute_command(true)
             .capacity_provider_strategy(cap_strategy)
             .network_configuration(network_config);
 
@@ -405,10 +540,50 @@ async fn apply_ecs(
             create_req = create_req.service_registries(registry.build());
         }
 
-        create_req
-            .send()
-            .await
-            .context("failed to create ECS service")?;
+        // Retry with backoff if ECS reports "still Draining" (race with a
+        // recent delete that hasn't fully completed yet).
+        // Match on the typed error code (InvalidParameterException) rather than
+        // raw message text to be resilient to SDK/API wording changes.
+        use aws_sdk_ecs::error::ProvideErrorMetadata;
+        const DRAIN_RETRY_ATTEMPTS: u32 = 12;
+        const DRAIN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        for attempt in 0..DRAIN_RETRY_ATTEMPTS {
+            match create_req.clone().send().await {
+                Ok(_) => {
+                    if attempt > 0 {
+                        eprintln!(" ok");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let is_draining = e.code() == Some("InvalidParameterException")
+                        && e.message()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains("draining");
+                    let is_last = attempt == DRAIN_RETRY_ATTEMPTS - 1;
+                    if is_draining && !is_last {
+                        if attempt == 0 {
+                            eprint!("  ⏳ Service still draining, retrying...");
+                        } else {
+                            eprint!(".");
+                        }
+                        tokio::time::sleep(DRAIN_RETRY_INTERVAL).await;
+                    } else {
+                        if attempt > 0 {
+                            eprintln!(" failed");
+                        }
+                        let ctx = if is_last && is_draining {
+                            "failed to create ECS service after retries (service still draining)"
+                        } else {
+                            "failed to create ECS service"
+                        };
+                        return Err(e).context(ctx);
+                    }
+                }
+            }
+        }
         println!(
             "  ✓ {} created ({}, {}cpu/{}mem{})",
             m.metadata.name,
@@ -440,6 +615,21 @@ async fn apply_ecs(
         for u in &urls {
             println!("     {u}");
         }
+
+        // Best-effort: register the Telegram webhook so the bot starts
+        // receiving updates without a manual `curl setWebhook` step. Only
+        // fires when `/webhook/telegram` is one of the ingress paths and
+        // spec.secrets has a TELEGRAM_BOT_TOKEN entry; a no-op otherwise.
+        // Never fails `apply` — the AWS provisioning above already
+        // succeeded, and this is a convenience on top of it.
+        let path_urls: Vec<(String, String)> =
+            ingress.paths.iter().cloned().zip(urls.iter().cloned()).collect();
+        match crate::ingress::register_telegram_webhook(config, &m.spec.secrets, &path_urls).await
+        {
+            Ok(Some(desc)) => eprintln!("  ✓ Telegram webhook registered: {desc}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("  ⚠ Telegram webhook registration failed (apply still succeeded): {e}"),
+        }
     }
 
     if wait {
@@ -451,22 +641,71 @@ async fn apply_ecs(
     Ok(())
 }
 
+/// Poll until the ECS service's deployment stabilizes, printing each
+/// transition as a composite status string — same vocabulary `ecsctl`
+/// itself uses for `get`/`alias ls` (github.com/oablab/ecsctl,
+/// src/alias.rs): `RUNNING`, `REPLACING(n→m)` (new deployment's tasks still
+/// coming up), `DRAINING(n+m)` (new deployment up, old one's tasks still
+/// stopping), `PENDING(n)`, `PARTIAL(n/m)`, or the raw ECS service status as
+/// a fallback — reused here for a consistent status vocabulary across both
+/// tools instead of raw `running_count`/`rollout_state` fields.
 async fn wait_for_stable(ecs: &aws_sdk_ecs::Client, cluster: &str, service: &str) -> Result<()> {
-    for _ in 0..60 {
+    for i in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let resp = ecs.describe_services()
             .cluster(cluster)
             .services(service)
             .send().await?;
-        if let Some(svc) = resp.services().first() {
-            let deployments = svc.deployments();
-            if deployments.len() == 1 {
-                if let Some(d) = deployments.first() {
-                    if d.running_count() == d.desired_count() && d.rollout_state() == Some(&aws_sdk_ecs::types::DeploymentRolloutState::Completed) {
-                        return Ok(());
-                    }
+        let elapsed = (i + 1) * 5;
+
+        let Some(svc) = resp.services().first() else {
+            eprintln!("    [{elapsed}s] service not found in describe-services response yet");
+            continue;
+        };
+
+        let running = svc.running_count() as usize;
+        let desired = svc.desired_count() as usize;
+        let pending = svc.pending_count() as usize;
+        let deployments = svc.deployments();
+        let num_deployments = deployments.len();
+        let primary = deployments
+            .iter()
+            .find(|d| d.status().unwrap_or_default() == "PRIMARY")
+            .or_else(|| deployments.first());
+
+        let status = if desired == 0 {
+            "STOPPED".to_string()
+        } else if running == desired && pending == 0 && num_deployments <= 1 {
+            "RUNNING".to_string()
+        } else if num_deployments > 1 {
+            if let Some(p) = primary {
+                let p_running = p.running_count() as usize;
+                let p_desired = p.desired_count() as usize;
+                if p_running < p_desired {
+                    format!("REPLACING({p_running}→{p_desired})")
+                } else {
+                    let old_running: usize = deployments
+                        .iter()
+                        .filter(|d| d.status().unwrap_or_default() != "PRIMARY")
+                        .map(|d| d.running_count() as usize)
+                        .sum();
+                    format!("DRAINING({p_running}+{old_running})")
                 }
+            } else {
+                svc.status().unwrap_or("UNKNOWN").to_string()
             }
+        } else if pending > 0 {
+            format!("PENDING({pending})")
+        } else if running < desired {
+            format!("PARTIAL({running}/{desired})")
+        } else {
+            svc.status().unwrap_or("UNKNOWN").to_string()
+        };
+
+        eprintln!("    [{elapsed}s] {status}");
+
+        if status == "RUNNING" {
+            return Ok(());
         }
     }
     anyhow::bail!("timed out waiting for service to stabilize (5 min)")

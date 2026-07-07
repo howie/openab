@@ -53,6 +53,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 - **Kubernetes-ready** — Dockerfile + k8s manifests with PVC for auth persistence
 - **Voice message STT** — auto-transcribes Discord voice messages via Groq, OpenAI, or local Whisper server ([docs/stt.md](docs/stt.md))
 - **Lifecycle hooks** — run custom scripts at startup (`pre_boot`) and shutdown (`pre_shutdown`) for bootstrapping, S3 sync, and state backup ([docs/hooks.md](docs/hooks.md))
+- **Tailscale integration** — join a private tailnet from an unprivileged container via lifecycle hooks, no custom image needed ([docs/tailscale.md](docs/tailscale.md))
 
 ## Quick Start
 
@@ -264,6 +265,22 @@ kubectl apply -f k8s/deployment.yaml
 | `k8s/configmap.yaml` | `config.toml` mounted at `/etc/openab/` |
 | `k8s/secret.yaml` | `DISCORD_BOT_TOKEN` injected as env var |
 | `k8s/pvc.yaml` | Persistent storage for auth + settings |
+
+## AWS ECS Deployment
+
+Prefer AWS-native infrastructure over Kubernetes? [`oabctl`](operator/) is a
+CLI that provisions and manages OpenAB agents on Amazon ECS Fargate — one
+command bootstraps the cluster/IAM/S3/networking, and one command deploys an
+agent, including Telegram/LINE webhook ingress (API Gateway → VPC Link →
+Cloud Map) provisioned automatically.
+
+```bash
+oabctl bootstrap                            # one-time infra setup
+oabctl create my-bot && oabctl apply -f my-bot/manifest.yaml --wait
+```
+
+See **[docs/oabctl.md](docs/oabctl.md)** for the full guide — installation,
+manifest schema, ingress/webhooks, secrets, and bootstrap.
 
 ## Inspired By
 

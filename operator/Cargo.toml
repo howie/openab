@@ -36,3 +36,4 @@ toml = "0.8"
 anyhow = "1.0"
 dirs = "6"
 rpassword = "7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

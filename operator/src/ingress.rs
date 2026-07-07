@@ -28,6 +28,7 @@ use crate::manifest::{Ingress, OABServiceManifest};
 use anyhow::{Context, Result};
 use aws_sdk_apigatewayv2::types::{ConnectionType, IntegrationType, ProtocolType};
 use aws_sdk_servicediscovery::types::{DnsConfig, DnsRecord, RecordType};
+use std::collections::HashMap;
 
 const STAGE_NAME: &str = "prod";
 
@@ -138,9 +139,106 @@ pub async fn ensure_gateway(
     Ok(webhook_urls(&api_endpoint, &ingress.paths))
 }
 
+/// Find the `/webhook/telegram` URL among the resolved webhook URLs, and
+/// confirm a `TELEGRAM_BOT_TOKEN` secret is configured. Returns `None` if
+/// either is missing, meaning [`register_telegram_webhook`] should no-op.
+fn find_telegram_webhook(
+    secrets: &std::collections::HashMap<String, String>,
+    webhook_urls: &[(String, String)],
+) -> Option<(String, String)> {
+    let url = webhook_urls
+        .iter()
+        .find(|(path, _)| path == "/webhook/telegram")
+        .map(|(_, url)| url.clone())?;
+    let token_ref = secrets.get("TELEGRAM_BOT_TOKEN")?.clone();
+    Some((url, token_ref))
+}
+
+/// Register the webhook URL with Telegram's Bot API (`setWebhook`), so the
+/// bot starts receiving updates without a manual `curl` step. Only runs when
+/// `spec.secrets` has a `TELEGRAM_BOT_TOKEN` entry and one of the ingress
+/// paths is `/webhook/telegram`; a no-op otherwise. If `TELEGRAM_SECRET_TOKEN`
+/// is also present, it's passed through so Telegram includes it on every
+/// webhook request (openab's Telegram adapter validates it).
+///
+/// Best-effort: errors are returned to the caller to print as a warning, but
+/// are never fatal to `apply` — the AWS-side provisioning already succeeded
+/// by this point, and a failed Telegram API call (e.g. bad token, network
+/// blip) shouldn't roll any of that back or fail the whole command.
+pub async fn register_telegram_webhook(
+    config: &aws_config::SdkConfig,
+    secrets: &std::collections::HashMap<String, String>,
+    webhook_urls: &[(String, String)],
+) -> Result<Option<String>> {
+    let Some((url, token_arn)) = find_telegram_webhook(secrets, webhook_urls) else {
+        return Ok(None);
+    };
+
+    let sm = aws_sdk_secretsmanager::Client::new(config);
+    let bot_token = crate::secrets::resolve_string(&sm, &token_arn)
+        .await
+        .context("failed to resolve TELEGRAM_BOT_TOKEN")?;
+
+    let secret_token = match secrets.get("TELEGRAM_SECRET_TOKEN") {
+        Some(v) => Some(
+            crate::secrets::resolve_string(&sm, v)
+                .await
+                .context("failed to resolve TELEGRAM_SECRET_TOKEN")?,
+        ),
+        None => None,
+    };
+
+    let mut form = vec![("url".to_string(), url)];
+    if let Some(st) = secret_token {
+        form.push(("secret_token".to_string(), st));
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("https://api.telegram.org/bot{bot_token}/setWebhook"))
+        .form(&form)
+        .send()
+        .await
+        .context("failed to call Telegram setWebhook API")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("failed to parse Telegram setWebhook response")?;
+
+    if !status.is_success() || body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        anyhow::bail!(
+            "Telegram setWebhook failed: {}",
+            body.get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        );
+    }
+    Ok(Some(
+        body.get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("webhook registered")
+            .to_string(),
+    ))
+}
+
+
 /// API Gateway route key for a webhook path (POST only).
 fn route_key(path: &str) -> String {
     format!("POST {path}")
+}
+
+/// Whether an integration's request parameters already carry the
+/// `overwrite:path` override needed to strip the stage prefix before it
+/// reaches the backend. Without this, private (VPC_LINK) integrations
+/// forward the stage-prefixed path (e.g. `/prod/webhook/telegram`) to the
+/// container, and openab's exact-match router 404s on it. See:
+/// <https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-private.html>
+fn has_stage_path_override(request_parameters: Option<&HashMap<String, String>>) -> bool {
+    request_parameters
+        .and_then(|p| p.get("overwrite:path"))
+        .map(|v| v == "$request.path")
+        .unwrap_or(false)
 }
 
 /// Extract the Cloud Map service ID from its ARN
@@ -733,7 +831,23 @@ async fn ensure_integration(
                     .integration_id()
                     .context("integration missing id")?
                     .to_string();
-                eprintln!("  ✓ Integration exists → {integration_uri}");
+                if has_stage_path_override(i.request_parameters()) {
+                    eprintln!("  ✓ Integration exists → {integration_uri}");
+                } else {
+                    // Self-heal: existing integrations created before this
+                    // fix forward the stage-prefixed path to the backend,
+                    // causing every request to 404. Patch in the override.
+                    eprintln!(
+                        "  ↻ Integration exists but missing path override → {integration_uri}, patching"
+                    );
+                    api.update_integration()
+                        .api_id(api_id)
+                        .integration_id(&id)
+                        .request_parameters("overwrite:path", "$request.path")
+                        .send()
+                        .await
+                        .context("failed to patch integration path override")?;
+                }
                 return Ok(id);
             }
         }
@@ -743,6 +857,13 @@ async fn ensure_integration(
         }
     }
     eprintln!("  ⊕ Creating integration → {integration_uri}");
+    // For private (VPC_LINK) integrations, API Gateway forwards the stage
+    // portion of the request path to the backend by default (e.g.
+    // `/prod/webhook/telegram` instead of `/webhook/telegram`), per AWS docs:
+    // https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-private.html
+    // openab's router matches the exact configured path, so without this
+    // override every request 404s at the backend. Overwrite the forwarded
+    // path with $request.path (stage-stripped) to match.
     let out = api
         .create_integration()
         .api_id(api_id)
@@ -752,6 +873,7 @@ async fn ensure_integration(
         .connection_type(ConnectionType::VpcLink)
         .connection_id(vpc_link_id)
         .payload_format_version("1.0")
+        .request_parameters("overwrite:path", "$request.path")
         .send()
         .await
         .context("failed to create integration")?;
@@ -880,6 +1002,60 @@ mod tests {
     fn route_key_is_post_prefixed() {
         assert_eq!(route_key("/webhook/telegram"), "POST /webhook/telegram");
         assert_eq!(route_key("/webhook/line"), "POST /webhook/line");
+    }
+
+    #[test]
+    fn stage_path_override_absent_when_no_request_parameters() {
+        // Integrations created before this fix have no RequestParameters at
+        // all, so they must be detected as needing the self-heal patch.
+        assert!(!has_stage_path_override(None));
+    }
+
+    #[test]
+    fn stage_path_override_absent_when_other_params_present() {
+        let params = HashMap::from([("someOtherKey".to_string(), "value".to_string())]);
+        assert!(!has_stage_path_override(Some(&params)));
+    }
+
+    #[test]
+    fn stage_path_override_absent_when_value_wrong() {
+        let params = HashMap::from([("overwrite:path".to_string(), "/literal/path".to_string())]);
+        assert!(!has_stage_path_override(Some(&params)));
+    }
+
+    #[test]
+    fn stage_path_override_present_when_correctly_set() {
+        let params = HashMap::from([("overwrite:path".to_string(), "$request.path".to_string())]);
+        assert!(has_stage_path_override(Some(&params)));
+    }
+
+    #[test]
+    fn find_telegram_webhook_finds_url_and_token() {
+        let secrets = HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
+        let urls = vec![
+            ("/webhook/line".to_string(), "https://x/prod/webhook/line".to_string()),
+            ("/webhook/telegram".to_string(), "https://x/prod/webhook/telegram".to_string()),
+        ];
+        let (url, token) = find_telegram_webhook(&secrets, &urls).unwrap();
+        assert_eq!(url, "https://x/prod/webhook/telegram");
+        assert_eq!(token, "arn:aws:...");
+    }
+
+    #[test]
+    fn find_telegram_webhook_none_without_telegram_path() {
+        let secrets = HashMap::from([("TELEGRAM_BOT_TOKEN".to_string(), "arn:aws:...".to_string())]);
+        let urls = vec![("/webhook/line".to_string(), "https://x/prod/webhook/line".to_string())];
+        assert!(find_telegram_webhook(&secrets, &urls).is_none());
+    }
+
+    #[test]
+    fn find_telegram_webhook_none_without_bot_token_secret() {
+        let secrets = HashMap::new();
+        let urls = vec![(
+            "/webhook/telegram".to_string(),
+            "https://x/prod/webhook/telegram".to_string(),
+        )];
+        assert!(find_telegram_webhook(&secrets, &urls).is_none());
     }
 
     #[test]
