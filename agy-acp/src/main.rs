@@ -31,6 +31,12 @@ impl Adapter {
         cancelled: Arc<AtomicBool>,
         out_tx: mpsc::UnboundedSender<Option<String>>,
     ) -> PromptOutput {
+        // Snapshot agy's existing cli-*.log files before spawning so that, if the
+        // turn produces no output, we can attribute a freshly-written log (and any
+        // swallowed backend error it records) to this specific turn. See
+        // `detect_swallowed_agy_error`.
+        let log_pre_snapshot = snapshot_agy_logs(&conversations_dir);
+
         let spawn_result = Command::new(Adapter::agy_bin())
             .args(&args)
             .env("PATH", Adapter::augmented_path())
@@ -153,6 +159,22 @@ impl Adapter {
                             session_update,
                         };
                     }
+                } else if !was_cancelled && !had_updates {
+                    // agy exited 0 but streamed nothing this turn. `agy --print`
+                    // swallows backend failures (e.g. quota 429 / RESOURCE_EXHAUSTED)
+                    // with a 0 exit code and empty stdout/stderr, recording the cause
+                    // only in its own cli.log. An empty successful turn is therefore
+                    // almost always a hidden error; surface it as a JSON-RPC error
+                    // (mirroring claude-agent-acp) instead of a blank "(no response)".
+                    if let Some(details) = detect_swallowed_agy_error(&conversations_dir, &log_pre_snapshot) {
+                        eprintln!("[agy-acp] surfacing swallowed agy error: {}", details);
+                        return PromptOutput {
+                            response_lines: vec![serde_json::to_string(&JsonRpcResponse {
+                                jsonrpc: "2.0", id, result: None, error: Some(json!({"code":-32603,"message":details})),
+                            }).unwrap()],
+                            session_update,
+                        };
+                    }
                 }
             }
             Err(e) => {
@@ -173,6 +195,97 @@ impl Adapter {
             session_update,
         }
     }
+}
+
+/// List agy's current `cli-*.log` file names under `<conversations_dir>/../log`.
+/// Used to snapshot the log directory before a turn so new logs can be detected.
+fn snapshot_agy_logs(conversations_dir: &std::path::Path) -> HashSet<String> {
+    let Some(log_dir) = conversations_dir.parent().map(|p| p.join("log")) else {
+        return HashSet::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return HashSet::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("cli-") && n.ends_with(".log"))
+        .collect()
+}
+
+/// Scan the `cli-*.log` files agy wrote during this turn for a backend error it
+/// swallowed. `agy --print` exits 0 with empty stdout/stderr when the model
+/// backend fails (e.g. quota 429 / RESOURCE_EXHAUSTED), recording the cause only
+/// in its own cli.log. Prefers logs created during this turn (not in
+/// `pre_snapshot`); falls back to the most recently modified log otherwise.
+/// Returns a cleaned, human-readable message when a known signature is found.
+fn detect_swallowed_agy_error(
+    conversations_dir: &std::path::Path,
+    pre_snapshot: &HashSet<String>,
+) -> Option<String> {
+    let log_dir = conversations_dir.parent()?.join("log");
+
+    let collect = |only_new: bool| -> Vec<(std::time::SystemTime, std::path::PathBuf)> {
+        let Ok(entries) = std::fs::read_dir(&log_dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if !name.starts_with("cli-") || !name.ends_with(".log") {
+                    return None;
+                }
+                if only_new && pre_snapshot.contains(&name) {
+                    return None;
+                }
+                let mtime = e.metadata().ok()?.modified().ok()?;
+                Some((mtime, e.path()))
+            })
+            .collect()
+    };
+
+    // Prefer logs written during this turn; if none appeared, use the newest.
+    let mut candidates = collect(true);
+    if candidates.is_empty() {
+        candidates = collect(false);
+    }
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
+
+    candidates.iter().take(3).find_map(|(_, path)| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| extract_agy_error_message(&content))
+    })
+}
+
+/// Extract a clean, single-line error message from agy's cli.log content. agy
+/// logs errors via glog (`E0707 08:34:23.910604  84 log.go:398] <msg>`) and
+/// self-wraps them (`<msg>.: <msg>`); this returns the most specific terminal
+/// error, de-wrapped and byte-length-capped on a char boundary.
+fn extract_agy_error_message(content: &str) -> Option<String> {
+    // Most specific terminal error first.
+    const ANCHORS: [&str; 3] = ["agent executor error:", "model unreachable:", "RESOURCE_EXHAUSTED"];
+    for anchor in ANCHORS {
+        // The last matching line is the terminal failure (retries log the same anchor).
+        if let Some(line) = content.lines().rev().find(|l| l.contains(anchor)) {
+            let start = line.find(anchor)?;
+            let mut msg = line[start..].trim().to_string();
+            // Drop glog's self-wrapped duplicate tail ("<msg>.: <msg>").
+            if let Some((first, _)) = msg.split_once(".: ") {
+                msg = format!("{}.", first);
+            }
+            if msg.len() > 500 {
+                let mut end = 500;
+                while !msg.is_char_boundary(end) {
+                    end -= 1;
+                }
+                msg.truncate(end);
+            }
+            return Some(msg);
+        }
+    }
+    None
 }
 
 #[tokio::main]
@@ -459,6 +572,56 @@ mod tests {
     fn test_json_rpc_id_as_number() {
         let req: JsonRpcRequest = serde_json::from_str(r#"{"jsonrpc":"2.0","id":42,"method":"initialize"}"#).unwrap();
         assert_eq!(req.id, Some(json!(42)));
+    }
+
+    const QUOTA_LOG: &str = "\
+I0707 08:34:18.847769  84 http_helpers.go:208] URL: .../streamGenerateContent?alt=sse\n\
+I0707 08:34:20.615268  84 log.go:398] RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 40h52m50s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 40h52m50s.\n\
+E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 40h52m46s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 40h52m46s.\n";
+
+    #[test]
+    fn test_extract_agy_error_message_dewraps_quota_error() {
+        let msg = extract_agy_error_message(QUOTA_LOG).expect("should detect quota error");
+        // Anchors on the most specific terminal error.
+        assert!(msg.starts_with("agent executor error:"), "got: {msg}");
+        // Human-readable cause is preserved.
+        assert!(msg.contains("Individual quota reached"), "got: {msg}");
+        assert!(msg.contains("Resets in 40h52m46s"), "got: {msg}");
+        // glog's self-wrapped duplicate tail is removed.
+        assert!(!msg.contains(".: "), "duplicate tail not stripped: {msg}");
+    }
+
+    #[test]
+    fn test_extract_agy_error_message_none_for_clean_log() {
+        let clean = "I0707 08:34:15.727406  84 printmode.go:225] Print mode: silent auth succeeded\n\
+                     I0707 08:34:15.871543  84 server.go:825] Created conversation abc\n";
+        assert_eq!(extract_agy_error_message(clean), None);
+    }
+
+    #[test]
+    fn test_detect_swallowed_agy_error_reads_new_turn_log() {
+        let root = std::env::temp_dir().join(format!("agy-acp-logscan-{}", Uuid::new_v4()));
+        let conversations = root.join("conversations");
+        let log_dir = root.join("log");
+        fs::create_dir_all(&conversations).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(log_dir.join("cli-20260707_083407.log"), QUOTA_LOG).unwrap();
+
+        let empty = HashSet::new();
+        let detected = detect_swallowed_agy_error(&conversations, &empty);
+        assert!(detected.is_some(), "should detect error in fresh log");
+        assert!(detected.unwrap().contains("Individual quota reached"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_detect_swallowed_agy_error_none_when_no_logs() {
+        let root = std::env::temp_dir().join(format!("agy-acp-logscan-empty-{}", Uuid::new_v4()));
+        let conversations = root.join("conversations");
+        fs::create_dir_all(&conversations).unwrap();
+        let empty = HashSet::new();
+        assert_eq!(detect_swallowed_agy_error(&conversations, &empty), None);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
