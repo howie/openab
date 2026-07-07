@@ -249,8 +249,11 @@ fn snapshot_agy_logs(conversations_dir: &std::path::Path) -> HashMap<String, u64
             return HashMap::new();
         }
     };
-    entries
-        .filter_map(|e| e.ok())
+    let mut dir_entry_errors = 0u32;
+    let snapshot: HashMap<String, u64> = entries
+        .filter_map(|e| {
+            e.inspect_err(|_| dir_entry_errors += 1).ok()
+        })
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             if !is_agy_cli_log(&name) {
@@ -264,7 +267,11 @@ fn snapshot_agy_logs(conversations_dir: &std::path::Path) -> HashMap<String, u64
                 }
             }
         })
-        .collect()
+        .collect();
+    if dir_entry_errors > 0 {
+        eprintln!("[agy-acp] {dir_entry_errors} entr(y/ies) in agy log dir {} could not be read while snapshotting", log_dir.display());
+    }
+    snapshot
 }
 
 /// Cap on how many bytes to scan from a single log's appended region. agy logs
@@ -278,7 +285,9 @@ const MAX_LOG_SCAN_BYTES: u64 = 256 * 1024;
 /// model backend fails (e.g. quota 429 / RESOURCE_EXHAUSTED), recording the
 /// cause only in its own cli.log. A candidate must have grown past its
 /// `pre_snapshot` size *and* been modified at or after `spawn_time` (when this
-/// turn's own agy child was spawned).
+/// turn's own agy child was spawned). Every candidate that grew is scanned
+/// (newest first, no arbitrary cap) so a genuinely empty turn's own log is
+/// never skipped in favor of another candidate.
 ///
 /// This narrows the window for a *reused* log file (bytes written before this
 /// turn's snapshot are excluded) but does **not** fully isolate a *concurrent*
@@ -309,34 +318,63 @@ fn detect_swallowed_agy_error(
     // Only logs that grew this turn (new file, or larger than the pre-turn
     // snapshot) and were modified at/after this turn's own agy child was
     // spawned; `offset` is where this turn's bytes begin, `len` its current size.
+    let mut dir_entry_errors = 0u32;
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64, u64)> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.inspect_err(|_| dir_entry_errors += 1).ok()
+        })
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             if !is_agy_cli_log(&name) {
                 return None;
             }
-            let meta = e.metadata().ok()?;
+            let meta = match e.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    eprintln!("[agy-acp] cannot stat agy log {name}: {err}; excluded from this turn's swallowed-error scan");
+                    return None;
+                }
+            };
             let offset = pre_snapshot.get(&name).copied().unwrap_or(0);
             if meta.len() <= offset {
                 return None; // nothing appended this turn
             }
-            let mtime = meta.modified().ok()?;
+            let mtime = match meta.modified() {
+                Ok(mtime) => mtime,
+                Err(err) => {
+                    eprintln!("[agy-acp] cannot read mtime of agy log {name}: {err}; excluded from this turn's swallowed-error scan");
+                    return None;
+                }
+            };
             if mtime < spawn_time {
                 return None; // grew before this turn's own agy child was spawned
             }
             Some((mtime, e.path(), offset, meta.len()))
         })
         .collect();
+    if dir_entry_errors > 0 {
+        eprintln!("[agy-acp] {dir_entry_errors} entr(y/ies) in agy log dir {} could not be read during scan", log_dir.display());
+    }
 
     candidates.sort_by_key(|(mtime, _, _, _)| std::cmp::Reverse(*mtime)); // newest first
 
     let scanned = candidates.len();
-    let found = candidates.iter().take(3).find_map(|(_, path, offset, len)| {
-        read_log_tail(path, *offset, *len).and_then(|c| extract_agy_error_message(&c))
+    let mut read_failures = 0u32;
+    let found = candidates.iter().find_map(|(_, path, offset, len)| {
+        match read_log_tail(path, *offset, *len) {
+            Some(content) => extract_agy_error_message(&content),
+            None => {
+                read_failures += 1;
+                None
+            }
+        }
     });
 
-    if found.is_none() && scanned > 0 {
+    if found.is_none() && read_failures > 0 {
+        eprintln!(
+            "[agy-acp] swallowed-error scan: {read_failures}/{scanned} grown log(s) could not be read; detection may have missed this turn's error"
+        );
+    } else if found.is_none() && scanned > 0 {
         eprintln!(
             "[agy-acp] swallowed-error scan: {scanned} log(s) grew this turn but no known error signature matched; treating as a genuinely empty turn"
         );
@@ -349,14 +387,28 @@ fn detect_swallowed_agy_error(
 /// allocation. `len` is the file's already-known size (from the caller's own
 /// directory scan), avoiding a redundant re-stat. Decoded lossily: a byte-range
 /// read can split a multi-byte char at the start boundary, but the error
-/// anchors we match are pure ASCII.
+/// anchors we match are pure ASCII. Logs (rather than silently returning
+/// `None`) on the specific I/O step that failed, so a read failure is never
+/// indistinguishable from "read fine, content just didn't match".
 fn read_log_tail(path: &std::path::Path, offset: u64, len: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[agy-acp] cannot open agy log {}: {e}", path.display());
+            return None;
+        }
+    };
     let start = offset.max(len.saturating_sub(MAX_LOG_SCAN_BYTES));
-    file.seek(SeekFrom::Start(start)).ok()?;
+    if let Err(e) = file.seek(SeekFrom::Start(start)) {
+        eprintln!("[agy-acp] cannot seek agy log {}: {e}", path.display());
+        return None;
+    }
     let mut buf = Vec::new();
-    file.take(MAX_LOG_SCAN_BYTES).read_to_end(&mut buf).ok()?;
+    if let Err(e) = file.take(MAX_LOG_SCAN_BYTES).read_to_end(&mut buf) {
+        eprintln!("[agy-acp] cannot read agy log {}: {e}", path.display());
+        return None;
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -834,9 +886,13 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         let empty_snapshot = snapshot_agy_logs(&conversations);
 
         // A concurrent/earlier session's log, fully written before spawn_time.
+        // The 1.1s gap comfortably clears 1-second mtime resolution on some
+        // filesystems (e.g. certain VM shared folders / FAT), so this test does
+        // not depend on sub-second timestamp precision to pass reliably.
         fs::write(log_dir.join("cli-20260707_083000.log"), QUOTA_LOG).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let spawn_time = std::time::SystemTime::now();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // This turn's own log, written after spawn_time, contains no error.
         fs::write(
@@ -853,10 +909,13 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
     }
 
     #[test]
-    fn test_detect_swallowed_agy_error_scans_beyond_first_candidate() {
-        // 4 logs grow this turn; only the oldest-by-mtime (4th newest) has the
-        // error. `.take(3)` means this is exactly the boundary where it would be
-        // missed if the cap were any smaller — documents current behavior.
+    fn test_detect_swallowed_agy_error_scans_all_grown_candidates_regardless_of_position() {
+        // 4 logs grow this turn; the OLDEST-by-mtime (written first, so it sorts
+        // last in the newest-first scan order) has the error, and 3 newer benign
+        // logs follow it. There is no cap on how many grown candidates are
+        // scanned, so the oldest candidate's error must still be found — a
+        // regression that reintroduces a fixed take(N) cap would silently drop
+        // this case once N+1 or more logs grow in the same turn.
         let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logscan-multi-{}", Uuid::new_v4())));
         let conversations = root.join("conversations");
         let log_dir = root.join("log");
@@ -865,32 +924,65 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         let empty = HashMap::new();
         let spawn_time = std::time::SystemTime::now();
 
-        for (i, name) in ["cli-a.log", "cli-b.log", "cli-c.log"].iter().enumerate() {
+        // Oldest candidate (written first): contains the error.
+        fs::write(log_dir.join("cli-a-oldest.log"), QUOTA_LOG).unwrap();
+        // 1.1s gaps comfortably clear 1-second mtime resolution on filesystems
+        // where it applies, so ordering is reliable without depending on
+        // sub-second timestamp precision.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for (i, name) in ["cli-b.log", "cli-c.log", "cli-d-newest.log"].iter().enumerate() {
             fs::write(log_dir.join(name), format!("I0707 08:3{i}:00.000000  84 server.go:825] turn ok\n")).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(1100));
         }
-        fs::write(log_dir.join("cli-d.log"), QUOTA_LOG).unwrap();
 
         let detected = detect_swallowed_agy_error(&conversations, &empty, spawn_time);
-        assert!(detected.is_some(), "error in the 4th grown log should still be found within the take(3)+newest-first scan");
+        assert!(
+            detected.is_some(),
+            "error in the oldest of 4 grown logs must still be found; there is no cap on candidates scanned"
+        );
     }
 
     #[test]
-    fn test_read_log_tail_respects_offset_and_cap_on_large_file() {
-        // A file larger than MAX_LOG_SCAN_BYTES, with a non-trivial offset placed
-        // after the cap boundary: the read must start at `offset`, not at
-        // `len - MAX_LOG_SCAN_BYTES`, and must not read past `len`.
-        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logtail-{}", Uuid::new_v4())));
+    fn test_read_log_tail_starts_at_offset_when_offset_is_more_restrictive() {
+        // File is smaller than MAX_LOG_SCAN_BYTES, so `len.saturating_sub(cap)`
+        // is 0 and `offset` is the binding constraint in `offset.max(...)`. If
+        // `offset` were dropped from that expression (as one prior test failed
+        // to catch), the read would start at 0 and wrongly include the
+        // pre-offset "earlier turn" content below.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logtail-offset-{}", Uuid::new_v4())));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("small.log");
+        let earlier_turn_prefix = "I0707 08:00:00.000000  84 server.go:825] earlier turn content\n";
+        let content = format!("{earlier_turn_prefix}{QUOTA_LOG}");
+        fs::write(&path, &content).unwrap();
+        let len = content.len() as u64;
+        let offset = earlier_turn_prefix.len() as u64;
+        assert!(len < MAX_LOG_SCAN_BYTES, "fixture must stay under the cap for this test to isolate the offset branch");
+
+        let tail = read_log_tail(&path, offset, len).expect("should read tail");
+        assert!(!tail.contains("earlier turn content"), "must not include bytes before offset: {tail}");
+        assert!(tail.starts_with("I0707 08:34"), "must start exactly at offset, got: {tail}");
+    }
+
+    #[test]
+    fn test_read_log_tail_caps_read_when_offset_is_less_restrictive() {
+        // File is larger than MAX_LOG_SCAN_BYTES and offset is 0, so
+        // `len.saturating_sub(cap)` is the binding constraint. The read must
+        // start there (not at 0) and so must exclude the leading filler bytes.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-logtail-cap-{}", Uuid::new_v4())));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("big.log");
         let prefix = "x".repeat((MAX_LOG_SCAN_BYTES as usize) + 1000);
         let content = format!("{prefix}{QUOTA_LOG}");
         fs::write(&path, &content).unwrap();
         let len = content.len() as u64;
-        let offset = prefix.len() as u64;
 
-        let tail = read_log_tail(&path, offset, len).expect("should read tail");
-        assert!(tail.contains("Individual quota reached"), "should read from offset, not from len - cap");
+        let tail = read_log_tail(&path, 0, len).expect("should read tail");
+        // If the cap floor were dropped in favor of `offset` (0 here), the read
+        // would start at byte 0 and, bounded to MAX_LOG_SCAN_BYTES, would never
+        // reach the quota-log suffix at all (the filler prefix alone exceeds the
+        // cap) -- so reaching it here proves the cap-floor branch is live.
+        assert!(tail.contains("Individual quota reached"), "should reach the error past the filler prefix");
         assert!(tail.len() as u64 <= MAX_LOG_SCAN_BYTES, "must not exceed the cap");
     }
 
