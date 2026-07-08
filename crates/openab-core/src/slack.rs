@@ -711,6 +711,40 @@ const RECONNECT_TIMEOUT_SECS: u64 = 30;
 /// backstop for the rare case the client builder failed and fell back to an
 /// unbounded `reqwest::Client::new()` (see #1279).
 const RECONNECT_HTTP_TIMEOUT_SECS: u64 = 35;
+/// Bounds outbound `write.send(...)` calls in the live socket loop. The
+/// inbound half-open case is guarded by `IDLE_TIMEOUT_SECS`, but a stalled
+/// *outbound* send parks the loop inside that `select!` branch forever too —
+/// and since it can never reach `ping_interval.tick()`, the idle watchdog
+/// itself becomes unreachable. Same bug class as #1279, on the write side.
+const WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// The Socket Mode WebSocket write half, as produced by splitting the stream
+/// returned from `connect_with_reconnect_timeout`. Named so the nested
+/// generic doesn't have to be repeated at every `send_with_timeout` call
+/// site.
+type SlackWsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tungstenite::Message,
+>;
+
+/// Result of `connect_with_reconnect_timeout`: the outer `Result` is the
+/// timeout, the inner `Result` is `connect_async`'s own outcome.
+type ConnectResult = std::result::Result<
+    std::result::Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::handshake::client::Response,
+        ),
+        tungstenite::Error,
+    >,
+    tokio::time::error::Elapsed,
+>;
+
+/// Result of `get_socket_mode_url_with_timeout`: `Err` is the outer timeout;
+/// `Ok` carries `get_socket_mode_url`'s own `anyhow::Result`.
+type SocketModeUrlResult = std::result::Result<Result<String>, tokio::time::error::Elapsed>;
 
 /// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
 fn next_backoff(cur: u64) -> u64 {
@@ -720,21 +754,25 @@ fn next_backoff(cur: u64) -> u64 {
 /// Wraps `connect_async` in the reconnect-path timeout. Extracted so the
 /// regression test exercises the exact same code path `run_slack_adapter`
 /// uses, instead of duplicating the timeout expression (#1279).
-async fn connect_with_reconnect_timeout(
-    ws_url: &str,
-) -> std::result::Result<
-    std::result::Result<
-        (
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            tungstenite::handshake::client::Response,
-        ),
-        tungstenite::Error,
-    >,
-    tokio::time::error::Elapsed,
-> {
+async fn connect_with_reconnect_timeout(ws_url: &str) -> ConnectResult {
     tokio::time::timeout(
         std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
         tokio_tungstenite::connect_async(ws_url),
+    )
+    .await
+}
+
+/// Send `msg` on `write`, bounded by `WRITE_TIMEOUT_SECS`. Mirrors
+/// `connect_with_reconnect_timeout`: extracted so every write in the live
+/// socket loop shares one bounded-send implementation instead of each call
+/// site duplicating (or omitting) the timeout.
+async fn send_with_timeout(
+    write: &mut SlackWsSink,
+    msg: tungstenite::Message,
+) -> std::result::Result<std::result::Result<(), tungstenite::Error>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+        write.send(msg),
     )
     .await
 }
@@ -792,12 +830,7 @@ pub async fn run_slack_adapter(
             return Ok(());
         }
 
-        let ws_url = match tokio::time::timeout(
-            std::time::Duration::from_secs(RECONNECT_HTTP_TIMEOUT_SECS),
-            get_socket_mode_url(&adapter.client, &app_token),
-        )
-        .await
-        {
+        let ws_url = match get_socket_mode_url_with_timeout(&adapter.client, &app_token).await {
             Ok(Ok(url)) => url,
             Ok(Err(e)) => {
                 error!(err = %e, backoff = backoff_secs, "failed to get Socket Mode URL, retrying");
@@ -848,9 +881,19 @@ pub async fn run_slack_adapter(
                                     // Acknowledge the envelope immediately
                                     if let Some(envelope_id) = envelope["envelope_id"].as_str() {
                                         let ack = serde_json::json!({"envelope_id": envelope_id});
-                                        let _ = write
-                                            .send(tungstenite::Message::Text(ack.to_string()))
-                                            .await;
+                                        if send_with_timeout(
+                                            &mut write,
+                                            tungstenite::Message::Text(ack.to_string()),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            warn!(
+                                                timeout = WRITE_TIMEOUT_SECS,
+                                                "Slack Socket Mode envelope ack timed out, reconnecting"
+                                            );
+                                            break;
+                                        }
                                     }
 
                                     // Slash commands and interactive block_actions aren't
@@ -1174,7 +1217,16 @@ pub async fn run_slack_adapter(
                                     }
                                 }
                                 Ok(tungstenite::Message::Ping(data)) => {
-                                    let _ = write.send(tungstenite::Message::Pong(data)).await;
+                                    if send_with_timeout(&mut write, tungstenite::Message::Pong(data))
+                                        .await
+                                        .is_err()
+                                    {
+                                        warn!(
+                                            timeout = WRITE_TIMEOUT_SECS,
+                                            "Slack Socket Mode pong send timed out, reconnecting"
+                                        );
+                                        break;
+                                    }
                                 }
                                 Ok(tungstenite::Message::Close(_)) => {
                                     warn!("Slack Socket Mode connection closed by server");
@@ -1198,14 +1250,24 @@ pub async fn run_slack_adapter(
                                 );
                                 break;
                             }
-                            if let Err(e) = write.send(tungstenite::Message::Ping(Vec::new())).await {
-                                warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
-                                break;
+                            match send_with_timeout(&mut write, tungstenite::Message::Ping(Vec::new())).await {
+                                Ok(Err(e)) => {
+                                    warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout = WRITE_TIMEOUT_SECS,
+                                        "Slack Socket Mode ping timed out, reconnecting"
+                                    );
+                                    break;
+                                }
+                                Ok(Ok(())) => {}
                             }
                         }
                         _ = shutdown_rx.changed() => {
                             info!("Slack adapter received shutdown signal");
-                            let _ = write.send(tungstenite::Message::Close(None)).await;
+                            let _ = send_with_timeout(&mut write, tungstenite::Message::Close(None)).await;
                             return Ok(());
                         }
                     }
@@ -1253,6 +1315,21 @@ async fn get_socket_mode_url(client: &reqwest::Client, app_token: &str) -> Resul
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("no url in apps.connections.open response"))
+}
+
+/// Wraps `get_socket_mode_url` in the reconnect-path HTTP timeout. Extracted
+/// (mirroring `connect_with_reconnect_timeout`) so the regression test calls
+/// the same production code path `run_slack_adapter` uses, instead of
+/// duplicating the timeout expression.
+async fn get_socket_mode_url_with_timeout(
+    client: &reqwest::Client,
+    app_token: &str,
+) -> SocketModeUrlResult {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(RECONNECT_HTTP_TIMEOUT_SECS),
+        get_socket_mode_url(client, app_token),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2388,8 +2465,8 @@ mod tests {
 #[cfg(test)]
 mod socket_keepalive_tests {
     use super::{
-        connect_with_reconnect_timeout, next_backoff, socket_idle, wait_backoff_or_shutdown,
-        IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
+        connect_with_reconnect_timeout, get_socket_mode_url_with_timeout, next_backoff,
+        socket_idle, wait_backoff_or_shutdown, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
     };
     use std::time::Duration;
 
@@ -2447,6 +2524,40 @@ mod socket_keepalive_tests {
         assert!(
             result.is_err(),
             "connect_async on a stalled handshake must time out, not hang"
+        );
+    }
+
+    /// Regression test for #1279 (the HTTP leg): a stalled `apps.connections.open`
+    /// call during reconnect must surface as a timeout instead of parking the
+    /// reconnect task forever. Overrides DNS resolution for `slack.com` to a
+    /// local listener that accepts the TCP connection and never responds, so
+    /// the client's TLS handshake stalls exactly like a silently-dropped peer
+    /// would. Calls `get_socket_mode_url_with_timeout` directly (the same
+    /// helper `run_slack_adapter` calls) so this pins the actual production
+    /// code path, mirroring `connect_async_timeout_fires_on_stalled_handshake`
+    /// above.
+    #[tokio::test(start_paused = true)]
+    async fn get_socket_mode_url_timeout_fires_on_stalled_http_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let _socket = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .resolve("slack.com", addr)
+            .build()
+            .expect("build client");
+
+        let result = get_socket_mode_url_with_timeout(&client, "xapp-test-token").await;
+
+        assert!(
+            result.is_err(),
+            "get_socket_mode_url on a stalled HTTP call must time out, not hang"
         );
     }
 
