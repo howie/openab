@@ -95,18 +95,11 @@ enum Commands {
     },
     /// Scale an OAB service (set desired task count)
     Scale {
-        /// Agent name or ecsctl alias
+        /// Agent name (OAB service)
         alias: String,
-        /// Desired task count (0–100)
-        #[arg(value_parser = clap::value_parser!(i32).range(0..=100))]
+        /// Desired task count (0 or 1)
+        #[arg(value_parser = clap::value_parser!(i32).range(0..=1))]
         size: i32,
-        /// Create/update a recurring schedule (e.g. "cron(0 8 * * ? *)" or "rate(1 hour)").
-        /// Omit for immediate scaling.
-        #[arg(long)]
-        with_schedule: Option<String>,
-        /// IANA timezone for schedule expression (e.g. "Asia/Taipei", default: UTC)
-        #[arg(long, default_value = "UTC")]
-        timezone: String,
     },
     /// Manage scaling schedules
     Schedule {
@@ -147,6 +140,20 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ScheduleAction {
+    /// Create a recurring scaling schedule
+    Create {
+        /// Agent name (OAB service)
+        alias: String,
+        /// Desired task count (0 or 1)
+        #[arg(value_parser = clap::value_parser!(i32).range(0..=1))]
+        size: i32,
+        /// Schedule expression: cron(...), rate(...), or at(...)
+        #[arg(long = "expression", alias = "expr")]
+        expression: String,
+        /// IANA timezone for schedule expression (default: UTC)
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+    },
     /// List all scaling schedules
     List,
     /// Delete a scaling schedule
@@ -245,17 +252,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Scale {
             alias,
             size,
-            with_schedule,
-            timezone,
         } => {
-            if let Some(schedule_expr) = with_schedule {
-                scale::run_with_schedule(&config, &alias, size, &schedule_expr, Some(&timezone))
-                    .await
-            } else {
-                scale::run(&config, &alias, size).await
-            }
+            scale::run(&config, &alias, size).await
         }
         Commands::Schedule { action } => match action {
+            ScheduleAction::Create {
+                alias,
+                size,
+                expression,
+                timezone,
+            } => {
+                scale::run_with_schedule(&config, &alias, size, &expression, Some(&timezone)).await
+            }
             ScheduleAction::List => scale::list_schedules(&config).await,
             ScheduleAction::Delete { name } => scale::delete_schedule(&config, &name).await,
         },

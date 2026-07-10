@@ -583,9 +583,9 @@ s3://oab-control-plane-{account}/
 | `oabctl exec <agent> -- <cmd>` | Execute command in container |
 | `oabctl cp <src> <dst>` | Copy files to/from container |
 | `oabctl sync <src> <dst>` | Sync directories (bidirectional) |
-| `oabctl scale <alias> <size>` | Immediately set desired task count (0–100) |
-| `oabctl scale <alias> <size> --with-schedule '<expr>'` | Create/update recurring schedule |
-| `oabctl scale <alias> <size> --with-schedule '<expr>' --timezone 'Asia/Taipei'` | Schedule with IANA timezone |
+| `oabctl scale <alias> <size>` | Immediately set desired task count (0 or 1) |
+| `oabctl schedule create <alias> <size> --expr '<expression>'` | Create/update recurring schedule |
+| `oabctl schedule create <alias> <size> --expr '<expression>' --timezone 'Asia/Taipei'` | Schedule with IANA timezone |
 | `oabctl schedule list` | List all scaling schedules |
 | `oabctl schedule delete <name>` | Remove a scaling schedule |
 
@@ -607,13 +607,13 @@ oabctl scale my-bot 0
 
 ```bash
 # Scale to 0 at 9PM Taipei time, every day
-oabctl scale my-bot 0 --with-schedule 'cron(0 21 * * ? *)' --timezone 'Asia/Taipei'
+oabctl schedule create my-bot 0 --expr 'cron(0 21 * * ? *)' --timezone 'Asia/Taipei'
 
 # Scale to 1 at 8AM
-oabctl scale my-bot 1 --with-schedule 'cron(0 8 * * ? *)' --timezone 'Asia/Taipei'
+oabctl schedule create my-bot 1 --expr 'cron(0 8 * * ? *)' --timezone 'Asia/Taipei'
 
 # Scale every 6 hours
-oabctl scale my-bot 1 --with-schedule 'rate(6 hours)'
+oabctl schedule create my-bot 1 --expr 'rate(6 hours)'
 ```
 
 **Schedule expressions** — must be one of:
