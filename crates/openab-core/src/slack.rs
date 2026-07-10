@@ -881,18 +881,30 @@ pub async fn run_slack_adapter(
                                     // Acknowledge the envelope immediately
                                     if let Some(envelope_id) = envelope["envelope_id"].as_str() {
                                         let ack = serde_json::json!({"envelope_id": envelope_id});
-                                        if send_with_timeout(
+                                        // Reconnect before dispatch if the ack cannot be written;
+                                        // Slack redelivers unacked envelopes, avoiding work it
+                                        // still considers pending.
+                                        match send_with_timeout(
                                             &mut write,
                                             tungstenite::Message::Text(ack.to_string()),
                                         )
                                         .await
-                                        .is_err()
                                         {
-                                            warn!(
-                                                timeout = WRITE_TIMEOUT_SECS,
-                                                "Slack Socket Mode envelope ack timed out, reconnecting"
-                                            );
-                                            break;
+                                            Ok(Err(e)) => {
+                                                warn!(
+                                                    error = %e,
+                                                    "Slack Socket Mode envelope ack failed, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    timeout = WRITE_TIMEOUT_SECS,
+                                                    "Slack Socket Mode envelope ack timed out, reconnecting"
+                                                );
+                                                break;
+                                            }
+                                            Ok(Ok(())) => {}
                                         }
                                     }
 
@@ -1217,15 +1229,27 @@ pub async fn run_slack_adapter(
                                     }
                                 }
                                 Ok(tungstenite::Message::Ping(data)) => {
-                                    if send_with_timeout(&mut write, tungstenite::Message::Pong(data))
-                                        .await
-                                        .is_err()
+                                    match send_with_timeout(
+                                        &mut write,
+                                        tungstenite::Message::Pong(data),
+                                    )
+                                    .await
                                     {
-                                        warn!(
-                                            timeout = WRITE_TIMEOUT_SECS,
-                                            "Slack Socket Mode pong send timed out, reconnecting"
-                                        );
-                                        break;
+                                        Ok(Err(e)) => {
+                                            warn!(
+                                                error = %e,
+                                                "Slack Socket Mode pong send failed, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                timeout = WRITE_TIMEOUT_SECS,
+                                                "Slack Socket Mode pong send timed out, reconnecting"
+                                            );
+                                            break;
+                                        }
+                                        Ok(Ok(())) => {}
                                     }
                                 }
                                 Ok(tungstenite::Message::Close(_)) => {
