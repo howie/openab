@@ -1,4 +1,19 @@
-# --- Build stage ---
+# ============================================================================
+# Hermes Agent — 自行維護版
+# ============================================================================
+# 修正原版的 429 rate limit 問題：不再從 raw.githubusercontent.com 抓 install.sh，
+# 改為直接 git clone + uv sync，完全繞過 rate-limited 端點。
+#
+# Build profiles（透過 --build-arg HERMES_PROFILE=...）:
+#   minimal  — 只裝核心依賴（~250MB），不含 ffmpeg/Node.js/gh CLI
+#   full     — 完整安裝含所有工具（~900MB），向下相容原版行為
+#
+# 用法：
+#   docker build -f Dockerfile.hermes --build-arg HERMES_PROFILE=minimal -t hermes:minimal .
+#   docker build -f Dockerfile.hermes --build-arg HERMES_PROFILE=full -t hermes:full .
+# ============================================================================
+
+# --- Build stage: compile openab from Rust source ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -16,36 +31,81 @@ COPY crates/ crates/
 COPY src/ src/
 RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && cargo build --release
 
+# --- Hermes agent stage: clone + install via uv (no install.sh) ---
+FROM python:3.12-slim-trixie AS hermes-deps
+
+# Build profile: "minimal" or "full"
+ARG HERMES_PROFILE=minimal
+# Pinned commit — change this to update Hermes version
+ARG HERMES_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
+
+# Install uv — from official release CDN (astral.sh), NOT raw.githubusercontent.com
+# astral.sh 是 uv 官方的 CDN，rate limit 遠高於 raw.githubusercontent.com
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Clone hermes-agent repo — 用 git clone（走 Git 協定），不是 curl raw file
+# Git smart HTTP 有自己的 rate limit pool，不受 raw.githubusercontent.com 影響
+RUN git clone --depth 1 \
+      https://github.com/NousResearch/hermes-agent.git \
+      /usr/local/lib/hermes-agent && \
+    cd /usr/local/lib/hermes-agent && \
+    git fetch --depth 1 origin "${HERMES_COMMIT}" && \
+    git checkout FETCH_HEAD
+
+WORKDIR /usr/local/lib/hermes-agent
+
+# Create venv + install deps based on profile
+# minimal: 只裝 pyproject.toml 的 [dependencies]（核心）+ [acp]（ACP adapter）
+# full: 裝 [all] extra（Google/MCP/YouTube/web 等全部）
+RUN uv venv venv --python 3.12 && \
+    if [ "$HERMES_PROFILE" = "full" ]; then \
+      UV_PROJECT_ENVIRONMENT=/usr/local/lib/hermes-agent/venv \
+        uv sync --extra all --extra acp --locked 2>&1; \
+    else \
+      UV_PROJECT_ENVIRONMENT=/usr/local/lib/hermes-agent/venv \
+        uv sync --extra acp --locked 2>&1; \
+    fi
+
+# Cleanup: 移除不需要的快取和 git metadata，節省映像空間
+RUN rm -rf .git \
+    /root/.cache/uv \
+    /root/.local/share/uv \
+    venv/lib/python3.12/site-packages/pip \
+    venv/lib/python3.12/site-packages/setuptools
+
 # --- Runtime stage ---
 FROM python:3.12-slim-trixie
 
-# Create agent user first so WORKDIR gets correct ownership
+ARG HERMES_PROFILE=minimal
+
 RUN useradd -m -u 1000 agent
 
+# 基礎系統套件 — minimal 不裝 ffmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl procps ripgrep tini git ffmpeg unzip xz-utils && \
+      ca-certificates curl procps ripgrep tini git unzip xz-utils \
+      $(if [ "$HERMES_PROFILE" = "full" ]; then echo "ffmpeg"; fi) && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Hermes Agent — pinned to known commit with checksum verification
-# Root install uses FHS layout: binary at /usr/local/bin/hermes, code at /usr/local/lib/hermes-agent
-# HERMES_HOME points to agent user's data dir for OAuth tokens and config
-ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
-ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
-      -o /tmp/install-hermes.sh && \
-    echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
-    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
-    rm /tmp/install-hermes.sh && \
-    (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
-    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
+# 從 hermes-deps stage 複製已安裝好的 Hermes Agent
+COPY --from=hermes-deps /usr/local/lib/hermes-agent /usr/local/lib/hermes-agent
 
-# Install gh CLI
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
+# 複製 uv binary（runtime 時 lazy-install 需要）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Symlink hermes 指令到 PATH
+RUN ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes && \
+    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp && \
+    chmod -R a+rX /usr/local/lib/hermes-agent
+
+# full profile: 額外安裝 gh CLI
+RUN if [ "$HERMES_PROFILE" = "full" ]; then \
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list && \
+      apt-get update && apt-get install -y --no-install-recommends gh && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 ENV HOME=/home/agent
 WORKDIR /home/agent
@@ -59,6 +119,8 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="hermes-acp"
 ENV OPENAB_AGENT_AUTH_COMMAND="hermes auth add"
+# uv 需要知道 Hermes 的安裝位置，lazy-install 時使用
+ENV UV_PROJECT_ENVIRONMENT="/usr/local/lib/hermes-agent/venv"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
