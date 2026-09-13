@@ -1,8 +1,13 @@
 # ============================================================================
 # Hermes Agent — 自行維護版
 # ============================================================================
-# 修正原版的 429 rate limit 問題：不再從 raw.githubusercontent.com 抓 install.sh，
-# 改為直接 git clone + uv sync，完全繞過 rate-limited 端點。
+# 原版 Dockerfile 在 build 時 curl raw.githubusercontent.com 抓 install.sh，
+# 該端點 unauthenticated rate limit 低，共用 CI runner 上頻繁 429。
+# （注意：nightly resolver 已改用認證 GitHub Contents API，429 不在那邊。）
+#
+# 本版改為 git clone + uv sync --locked，Docker build 階段不再存取任何
+# rate-limited 端點。uv 版本 pin 到明確 tag，供應鏈校驗由 uv.lock 的
+# per-package SHA256 hash 承擔。
 #
 # Build profiles（透過 --build-arg HERMES_PROFILE=...）:
 #   minimal  — 只裝核心依賴（~250MB），不含 ffmpeg/Node.js/gh CLI
@@ -39,9 +44,9 @@ ARG HERMES_PROFILE=minimal
 # Pinned commit — change this to update Hermes version
 ARG HERMES_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 
-# Install uv — from official release CDN (astral.sh), NOT raw.githubusercontent.com
-# astral.sh 是 uv 官方的 CDN，rate limit 遠高於 raw.githubusercontent.com
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Install uv — pinned version from GHCR (astral.sh official image)
+ARG UV_VERSION=0.12.13
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /usr/local/bin/uv
 
 # Clone hermes-agent repo — 用 git clone（走 Git 協定），不是 curl raw file
 # Git smart HTTP 有自己的 rate limit pool，不受 raw.githubusercontent.com 影響
@@ -89,8 +94,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 從 hermes-deps stage 複製已安裝好的 Hermes Agent
 COPY --from=hermes-deps /usr/local/lib/hermes-agent /usr/local/lib/hermes-agent
 
-# 複製 uv binary（runtime 時 lazy-install 需要）
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# 複製 uv binary（runtime 時 lazy-install 需要）——版本與 build stage 一致
+COPY --from=hermes-deps /usr/local/bin/uv /usr/local/bin/uv
 
 # Symlink hermes 指令到 PATH
 RUN ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes && \
