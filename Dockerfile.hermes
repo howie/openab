@@ -18,7 +18,7 @@
 #   docker build -f Dockerfile.hermes --build-arg HERMES_PROFILE=full -t hermes:full .
 # ============================================================================
 
-# --- Build stage: compile openab from Rust source ---
+# --- 建置階段：從 Rust 原始碼編譯 openab ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -36,15 +36,15 @@ COPY crates/ crates/
 COPY src/ src/
 RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && cargo build --release
 
-# --- Hermes agent stage: clone + install via uv (no install.sh) ---
+# --- Hermes agent 階段：git clone + uv 安裝（不經 install.sh）---
 FROM python:3.12-slim-trixie AS hermes-deps
 
-# Build profile: "minimal" or "full"
+# 建置 profile："minimal" 或 "full"
 ARG HERMES_PROFILE=minimal
-# Pinned commit — change this to update Hermes version
+# 釘選 commit — 更新 Hermes 版本時改這行
 ARG HERMES_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 
-# Install uv — pinned version from GHCR (astral.sh official image)
+# 安裝 uv — 從 GHCR 取得釘選版本（astral.sh 官方映像）
 ARG UV_VERSION=0.12.13
 COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /usr/local/bin/uv
 
@@ -59,9 +59,9 @@ RUN git clone --depth 1 \
 
 WORKDIR /usr/local/lib/hermes-agent
 
-# Create venv + install deps based on profile
-# minimal: 只裝 pyproject.toml 的 [dependencies]（核心）+ [acp]（ACP adapter）
-# full: 裝 [all] extra（Google/MCP/YouTube/web 等全部）
+# 建立 venv + 依 profile 安裝依賴
+# minimal：只裝 pyproject.toml 的 [dependencies]（核心）+ [acp]（ACP adapter）
+# full：裝 [all] extra（Google/MCP/YouTube/web 等全部）
 RUN uv venv venv --python 3.12 && \
     if [ "$HERMES_PROFILE" = "full" ]; then \
       UV_PROJECT_ENVIRONMENT=/usr/local/lib/hermes-agent/venv \
@@ -71,14 +71,14 @@ RUN uv venv venv --python 3.12 && \
         uv sync --extra acp --locked 2>&1; \
     fi
 
-# Cleanup: 移除不需要的快取和 git metadata，節省映像空間
+# 清理：移除不需要的快取和 git metadata，節省映像空間
 RUN rm -rf .git \
     /root/.cache/uv \
     /root/.local/share/uv \
     venv/lib/python3.12/site-packages/pip \
     venv/lib/python3.12/site-packages/setuptools
 
-# --- Runtime stage ---
+# --- 執行階段 ---
 FROM python:3.12-slim-trixie
 
 ARG HERMES_PROFILE=minimal
@@ -97,12 +97,12 @@ COPY --from=hermes-deps /usr/local/lib/hermes-agent /usr/local/lib/hermes-agent
 # 複製 uv binary（runtime 時 lazy-install 需要）——版本與 build stage 一致
 COPY --from=hermes-deps /usr/local/bin/uv /usr/local/bin/uv
 
-# Symlink hermes 指令到 PATH
+# 建立 hermes 指令的 symlink 到 PATH
 RUN ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes && \
     ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp && \
     chmod -R a+rX /usr/local/lib/hermes-agent
 
-# full profile: 額外安裝 gh CLI
+# full profile：額外安裝 gh CLI
 RUN if [ "$HERMES_PROFILE" = "full" ]; then \
       curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
