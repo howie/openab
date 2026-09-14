@@ -36,6 +36,10 @@ COPY crates/ crates/
 COPY src/ src/
 RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && cargo build --release
 
+# --- uv stage：釘選版本，供後續 stage 用 COPY --from=uv ---
+ARG UV_VERSION=0.12.13
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 # --- Hermes agent 階段：git clone + uv 安裝（不經 install.sh）---
 FROM python:3.12-slim-trixie AS hermes-deps
 
@@ -45,9 +49,8 @@ ARG HERMES_PROFILE=full
 # 釘選 commit — 更新 Hermes 版本時改這行
 ARG HERMES_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 
-# 安裝 uv — 從 GHCR 取得釘選版本（astral.sh 官方映像）
-ARG UV_VERSION=0.12.13
-COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /usr/local/bin/uv
+# 安裝 uv — 從 uv stage 複製（版本由全域 UV_VERSION ARG 控制）
+COPY --from=uv /uv /usr/local/bin/uv
 
 # hermes-deps stage 需要 git 來 clone repo（python:3.12-slim 不含 git）
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
@@ -104,8 +107,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 從 hermes-deps stage 複製已安裝好的 Hermes Agent
 COPY --from=hermes-deps /usr/local/lib/hermes-agent /usr/local/lib/hermes-agent
 
-# 複製 uv binary（runtime 時按需安裝 optional extras 用）——版本與 build stage 一致
-COPY --from=hermes-deps /usr/local/bin/uv /usr/local/bin/uv
+# 複製 uv binary（runtime 時按需安裝 optional extras 用）——版本與 uv stage 一致
+COPY --from=uv /uv /usr/local/bin/uv
 
 # 建立 hermes 指令的 symlink 到 PATH，並驗證目標存在
 RUN for bin in hermes hermes-acp; do \
